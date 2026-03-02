@@ -74,10 +74,8 @@ Video-MemComp/
 │       ├── eval_egoschema.sh
 │       ├── eval_mlvu.sh
 │       ├── eval_ovobench.sh
-│       ├── eval_streamingbench.sh
 │       ├── eval_videomme.sh
 │       ├── videomme.py
-│       ├── videomme_768.py
 │       └── test_mlvu_minimal.sh
 │
 └── qwen2_vl/
