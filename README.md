@@ -30,7 +30,7 @@ This repository contains the **official implementation** of Video-MemComp.
 * [📊 Reproducibility](#-reproducibility)
 * [📌 Notes](#-notes)
 * [📎 Citation](#-citation)
-* 
+
 ---
 
 # 🔍 Overview
