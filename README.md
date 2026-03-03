@@ -1,5 +1,4 @@
 # 🎬 Video-MemComp
-
 ---
 
 # 📚 Table of Contents
