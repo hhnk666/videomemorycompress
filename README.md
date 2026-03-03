@@ -1,132 +1,284 @@
-# video-memcomp
-## 🔍 Overview
-
-**Video-MemComp** is a structure-aware memory compression framework for **long-form and streaming video understanding** with Multimodal Large Language Models (MLLMs).
-
-Unlike heuristic KV pruning or retrieval-based methods, Video-MemComp is **theoretically grounded** in a first-order Taylor expansion of error propagation, decomposing compression error into:
-
-* **Local Approximation Error** (mitigated via *Pre-RoPE Aggregation*)
-* **Layer-wise Structural Sensitivity** (managed via *dynamic budget allocation*)
-
-This enables **strict O(1) KV memory** w.r.t. video length while preserving or even improving accuracy.
+# 🎬 Video-MemComp
 
 ---
 
-## ✨ Key Features
+# 📚 Table of Contents
 
-* ✅ **Strict O(1) KV cache** (constant w.r.t. video length)
-* ✅ Works for **offline & streaming video benchmarks**
-* ✅ Supports multiple MLLM backbones:
+* [📄 Paper](#-paper)
+* [🔍 Overview](#-overview)
+* [📊 Experimental Results](#-experimental-results)
+* [✨ Key Features](#-key-features)
+* [🧠 Supported Backbones](#-supported-backbones)
+* [📁 Repository Structure](#-repository-structure)
+* [📥 Model Download Instructions](#-model-download-instructions)
 
-  * Qwen2-VL / Qwen2.5-VL
-  * LLaVA-OneVision
-  * InternVL 3.5
-* ✅ No CPU offloading / retrieval latency
-* ✅ Ready-to-run evaluation scripts
+  * [Qwen2-VL-7B](#1️⃣-qwen2-vl-7b)
+  * [Qwen2.5-VL](#2️⃣-qwen25-vl-3b--7b)
+  * [LLaVA-OneVision-7B](#3️⃣-llava-onevision-7b)
+  * [InternVL-3.5-2B](#4️⃣-internvl-35-2b)
+* [📊 Supported Benchmarks](#-supported-benchmarks)
+* [📥 Dataset Setup](#-dataset-setup)
+
+  * [EgoSchema](#egoschema)
+  * [MLVU](#mlvu)
+  * [VideoMME](#videomme)
+  * [OVO-Bench](#ovo-bench)
+* [⚙️ Environment Setup](#️-environment-setup)
+* [🚀 Running Experiments](#-running-experiments)
+* [📊 Reproducibility](#-reproducibility)
+* [📌 Notes](#-notes)
+* [📎 Citation](#-citation)
+
+---
+## 📄 Paper
+
+**Video-MemComp: Extreme O(1)-Memory Compression for Streaming Video Understanding via Taylor Expansion**
+
+<img width="1660" height="1117" alt="image" src="https://github.com/user-attachments/assets/7b6fcf51-4101-434a-85eb-5f8187df02d1" />
+
+> *Figure 1. While standard Video-LLM models suffer from linear O(T)-memory growth, Video-MemComp maintains a strictly O(1)-memory via a Taylor expansion-guided hybrid strategy, enabling efficient streaming video understanding.*
+
+This repository contains the **official implementation** of Video-MemComp.
 
 ---
 
-## 📁 Repository Structure
+# 🔍 Overview
+
+Video-MemComp is a structure-aware KV memory compression framework for long-form and streaming video understanding with Multimodal Large Language Models (MLLMs).
+
+Unlike heuristic KV pruning or retrieval-based approaches, Video-MemComp is derived from a first-order Taylor expansion of error propagation and decomposes compression error into:
+
+* **Local Approximation Error**
+
+* **Layer-wise Structural Sensitivity**
+  
+<img width="1408" height="717" alt="image" src="https://github.com/user-attachments/assets/e784ccff-4d16-459b-8016-8f4190509c1a" />
+
+> *Figure 2. Overview of our Video-MemComp Framework. Guided by Taylor expansion (top), we split global memory compression into two objectives: 1) Minimizing Local Approximation Error (middle) via Pre-RoPE Aggregation and Intra-layer KV Pruning. 2) Managing Structural Sensitivity (bottom) via a Tri-Hybrid Budget Allocation strategy.*
+
+The framework enables:
+
+* Strict **O(1)** KV memory w.r.t. video length
+* No KV offloading
+* No retrieval latency
+* Strong performance across offline and streaming benchmarks
+
+---
+
+# 📊 Experimental Results
+
+<img width="1610" height="805" alt="image" src="https://github.com/user-attachments/assets/3be76d0e-bc57-4655-80ec-68b812817701" />
+
+> *Table 1. Performance Comparison on Offline Video Understanding Benchmarks. We evaluate Video-MemComp against state-of-the-art compression methods and full-cache baselines. Our method meets or exceeds full-cache performance under strict memory constraints.*
+
+<br>
+
+<img width="781" height="449" alt="image" src="https://github.com/user-attachments/assets/a79ac8cb-e435-4f94-9891-6d4559dcdf79" />
+
+> *Figure 3. Performance on MLVU with Qwen2-VL-7B. Our method outperforms strong baselines across all memory budgets, and even surpasses the Full KV baseline at 6K, 12K, and 24K KV budgets, showing that Video-MemComp removes redundancy while preserving key semantics.*
+
+---
+
+# ✨ Key Features
+
+* O(1) KV cache growth w.r.t. video length
+* Works for both offline & streaming video benchmarks
+* Supports multiple MLLM backbones
+* Backbone-specific hyperparameters provided
+* Reproducible evaluation scripts
+
+---
+
+# 🧠 Supported Backbones
+
+| Model              | Status |
+| ------------------ | ------ |
+| Qwen2-VL-7B        | ✅      |
+| Qwen2.5-VL-3B      | ✅      |
+| Qwen2.5-VL-7B      | ✅      |
+| LLaVA-OneVision-7B | ✅      |
+| InternVL-3.5 (2B)  | ✅      |
+
+---
+
+# 📁 Repository Structure
+
+After downloading models and datasets, your directory should look like:
 
 ```bash
 Video-MemComp/
+├── data/
+│   ├── egoschema/
+│   ├── mlvu/
+│   ├── videomme/
+│   └── ovobench/
+│
+├── model/
+│   ├── InternVL3_5/
+│   ├── Qwen2___5-VL-3B-Instruct/
+│   ├── Qwen2___5-VL-7B-Instruct/
+│   ├── qwen2vl/
+│   └── llava-onevision-qwen2-7b-ov-hf/
+│
 ├── internvl/
-│   ├── environment.yml
-│   ├── requirements.txt
-│   ├── egoschema.py
-│   ├── egoschema.sh
-│   ├── evaluate_mlvu_internvl.py
-│   ├── evaluate_mlvu_internvl.sh
-│   ├── videomme.py
-│   ├── videomme.sh
-│   └── InternVL3_5/
-│       ├── configuration_intern_vit.py
-│       ├── configuration_internvl_chat.py
-│       ├── modeling_intern_vit.py
-│       ├── modeling_internvl_chat.py
-│       └── conversation.py
-│
 ├── llavaov/
-│   ├── environment.yml
-│   ├── requirements.txt
-│   ├── chat.py
-│   ├── egoschema.py
-│   ├── egoschema.sh
-│   ├── mlvu.py
-│   ├── mlvu.sh
-│   ├── videomme.py
-│   ├── eval_videomme.sh
-│   └── llava_onevision/
-│       ├── configuration_llava_onevision.py
-│       ├── modeling_llava_onevision.py
-│       └── llavaov.py
-│
 ├── qwen2_5vl/
-│   ├── environment.yml
-│   ├── requirements.txt
-│   ├── qwen2_5_vl/
-│   │   ├── configuration_qwen2_5_vl.py
-│   │   ├── modeling_qwen2_5_vl_DTD.py
-│   │   ├── modular_qwen2_5_vl.py
-│   │   └── processing_qwen2_5_vl.py
-│   └── scripts/
-│       ├── eval_egoschema.py
-│       ├── eval_egoschema.sh
-│       ├── eval_mlvu.sh
-│       ├── eval_ovobench.sh
-│       ├── eval_videomme.sh
-│       ├── videomme.py
-│       └── test_mlvu_minimal.sh
-│
 └── qwen2_vl/
-    ├── environment.yml
-    ├── requirements.txt
-    ├── modeling_qwen2_vl.py
-    ├── mlvu.py
-    ├── mlvu.sh
-    ├── videomme.py
-    └── videomme.sh
+```
 
+> ⚠️ Model weights and datasets are NOT included in this repository and must be downloaded manually.
+
+---
+
+# 📥 Model Download Instructions
+
+Please download the following models and place them under `model/` as shown above.
+
+---
+
+## 1️⃣ Qwen2-VL-7B
+
+Model: Qwen2-VL
+
+Download from:[https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)
+
+Place into:
+
+```
+model/qwen2vl/
 ```
 
 ---
 
-## 🧪 Supported Benchmarks
+## 2️⃣ Qwen2.5-VL (3B / 7B)
 
-### Offline Video Understanding
+Model: Qwen2.5-VL
 
-* **VideoMME**
-* **MLVU**
-* **EgoSchema**
+Download from:
+[https://huggingface.co/Qwen](https://huggingface.co/Qwen)
 
-### Streaming Video Understanding
+Place into:
 
-* **RVS-Ego / RVS-Movie**
-* **OVO-Bench**
-* **StreamingBench**
-
-All results follow the **official dev-set protocol** used in prior work (ReKV, StreamMem, InfiniPot-V).
+```
+model/Qwen2___5-VL-3B-Instruct/
+model/Qwen2___5-VL-7B-Instruct/
+```
 
 ---
 
-## 🧠 Supported Models
+## 3️⃣ LLaVA-OneVision-7B
 
-| Backbone           | state |
-| ------------------ | ------ |
-| Qwen2-VL-7B        | ✅      |
-| Qwen2.5-VL-3B      | ✅      |
-| LLaVA-OneVision-7B | ✅      |
-| InternVL-3.5-2B    | ✅      |
+Model: LLaVA-OneVision
 
-Each backbone has **model-specific hyperparameters** (budget weights, thresholds), already encoded in the provided scripts.
+Download from:[https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf)
+
+Place into:
+
+```
+model/llava-onevision-qwen2-7b-ov-hf/
+```
 
 ---
 
-## ⚙️ Environment Setup
+## 4️⃣ InternVL-3.5-2B
 
-We recommend **one Conda environment per backbone**.
+Model: InternVL
 
-### Example: Qwen2.5-VL
+Download from:[https://huggingface.co/OpenGVLab/InternVL3_5-2B](https://huggingface.co/OpenGVLab/InternVL3_5-2B)
+
+Place into:
+
+```
+model/InternVL3_5/
+```
+
+---
+
+# 📊 Supported Benchmarks
+
+* VideoMME
+* MLVU
+* EgoSchema
+* OVO-Bench
+
+---
+
+# 📥 Dataset Setup
+
+---
+
+## EgoSchema
+
+Dataset: EgoSchema
+
+Official repo:[https://github.com/egoschema/EgoSchema](https://github.com/egoschema/EgoSchema)
+
+Expected structure:
+
+```
+data/egoschema/
+├── full.json
+├── subset_answers.json
+└── videos/
+```
+
+---
+
+## MLVU
+
+Dataset: MLVU
+
+Official repo:[https://github.com/MLVU-benchmark/MLVU](https://github.com/MLVU-benchmark/MLVU)
+
+Place under:
+
+```
+data/mlvu/
+```
+
+---
+
+## VideoMME
+
+Dataset: VideoMME
+
+Official repo:
+[https://github.com/VideoMME/VideoMME](https://github.com/VideoMME/VideoMME)
+
+Place under:
+
+```
+data/videomme/
+```
+
+Ensure videos are extracted into:
+
+```
+data/videomme/videos/
+```
+
+---
+
+## OVO-Bench
+
+Dataset: OVO-Bench
+
+Place under:
+
+```
+data/ovobench/
+├── chunked_videos/
+├── src_videos/
+└── ovo_bench_new.json
+```
+
+---
+
+# ⚙️ Environment Setup
+
+We recommend one Conda environment per backbone.
+
+Example (Qwen2.5-VL):
 
 ```bash
 conda env create -f qwen2_5vl/environment.yml
@@ -134,128 +286,59 @@ conda activate qwen2_5vl
 pip install -r qwen2_5vl/requirements.txt
 ```
 
-### Example: InternVL 3.5
-
-```bash
-conda env create -f internvl/environment.yml
-conda activate internvl
-pip install -r internvl/requirements.txt
-```
-
-> ⚠️ CUDA, PyTorch, and FlashAttention versions are **model-dependent**.
-> Please follow the `environment.yml` for each backbone.
+CUDA / PyTorch versions are backbone-specific.
+Please follow the provided `environment.yml`.
 
 ---
 
-## 🚀 Running Experiments
+# 🚀 Running Experiments
 
-All experiments are launched via **shell scripts**.
-Each script supports a **quick debug mode** and a **full evaluation mode**.
+All experiments are launched via provided shell scripts.
 
----
+Example:
 
-### 1️⃣ EgoSchema (Offline)
-
-#### Qwen2.5-VL
+### EgoSchema (Qwen2.5-VL)
 
 ```bash
 cd qwen2_5vl/scripts
 bash eval_egoschema.sh
 ```
 
-Key options inside the script:
+### MLVU
 
 ```bash
-RUN_SUBSET_ONLY="true"   # quick validation (≈500 samples)
-NFRAMES=768              # fixed frame budget
-DROP_METHOD="feature"   # Video-MemComp compression
-```
-
----
-
-### 2️⃣ MLVU (Offline)
-
-#### LLaVA-OneVision
-
-```bash
-cd llavaov
-bash mlvu.sh
-```
-
-#### Qwen2.5-VL
-
-```bash
-cd qwen2_5vl/scripts
 bash eval_mlvu.sh
 ```
 
----
-
-### 3️⃣ VideoMME
-
-#### InternVL
-
-```bash
-cd internvl
-bash videomme.sh
-```
-
-#### Qwen / LLaVA
+### VideoMME
 
 ```bash
 bash eval_videomme.sh
 ```
 
----
-
-### 4️⃣ Streaming Benchmarks
-
-#### OVO-Bench
+### Streaming (OVO-Bench)
 
 ```bash
 bash eval_ovobench.sh
 ```
 
-#### StreamingBench (Real-time)
+---
 
-```bash
-bash eval_streamingbench.sh
-```
+# 📊 Reproducibility
+
+* All hyperparameters follow the paper.
+* Results are computed on official dev splits.
+* No KV offloading.
+* No retrieval-based augmentation.
 
 ---
 
-## 📊 Efficiency & Memory
+# 📌 Notes
 
-* **No KV offloading**
-* **No retrieval latency**
-* **OOM-free on single A6000**
-* TTFT reduced by **~2×** compared to ReKV
-
-See paper Table for details.
+* Please verify model and dataset paths before running.
+* It is recommended to first run subset/debug mode before full evaluation.
+* GPU with large memory (e.g., A6000) is recommended for long videos.
 
 ---
 
-## 🔬 Ablation Studies
-
-The repo supports ablations for:
-
-* Inter-frame only vs Inter + Intra-frame compression
-* Budget allocation strategies
-* Spatial aggregation thresholds
-
-These are controlled via:
-
-```bash
-DROP_METHOD
-DROP_THRESHOLD
-NFRAMES
-```
-
----
-
-## 📌 Notes & Tips
-
-* All paths in scripts are **absolute** by default — please modify them to your local setup.
-* `RUN_SUBSET_ONLY=true` is **highly recommended** before full runs.
-* For distributed runs, scripts auto-select a free `MASTER_PORT`.
-
+# 📎 Citation
