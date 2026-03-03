@@ -1,0 +1,8 @@
+name: qwenomini
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - ffmpeg
+  - cmake
+prefix: /data1/nyh/conda_envs/qwenomini

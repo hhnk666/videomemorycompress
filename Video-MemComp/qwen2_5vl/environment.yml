@@ -1,0 +1,7 @@
+name: qwen2_5vl
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - ffmpeg
+prefix: /data1/nyh/conda_envs/qwen2_5vl
