@@ -1,9 +1,12 @@
-# 🎬 Video-MemComp
----
+# 🎬 **Video-MemComp: Extreme O(1)-Memory Compression for Streaming Video Understanding via Taylor Expansion**
+[**🏠 Project Page**](https://hhnk666.github.io/Video-MemComp.github.io) | [**📄 Arxiv (Coming Soon)**]()
 
-# 📚 Table of Contents
+<img width="1660" height="1117" alt="image" src="https://github.com/user-attachments/assets/7b6fcf51-4101-434a-85eb-5f8187df02d1" />
 
-* [📄 Paper](#-paper)
+> *Figure 1. While standard Video-LLM models suffer from linear O(T)-memory growth, Video-MemComp maintains a strictly O(1)-memory via a Taylor expansion-guided hybrid strategy, enabling efficient streaming video understanding.*
+
+This repository contains the **official implementation** of Video-MemComp.
+
 * [🔍 Overview](#-overview)
 * [📊 Experimental Results](#-experimental-results)
 * [✨ Key Features](#-key-features)
@@ -27,18 +30,7 @@
 * [📊 Reproducibility](#-reproducibility)
 * [📌 Notes](#-notes)
 * [📎 Citation](#-citation)
-
----
-## 📄 Paper
-
-**Video-MemComp: Extreme O(1)-Memory Compression for Streaming Video Understanding via Taylor Expansion**
-
-<img width="1660" height="1117" alt="image" src="https://github.com/user-attachments/assets/7b6fcf51-4101-434a-85eb-5f8187df02d1" />
-
-> *Figure 1. While standard Video-LLM models suffer from linear O(T)-memory growth, Video-MemComp maintains a strictly O(1)-memory via a Taylor expansion-guided hybrid strategy, enabling efficient streaming video understanding.*
-
-This repository contains the **official implementation** of Video-MemComp.
-
+* 
 ---
 
 # 🔍 Overview
