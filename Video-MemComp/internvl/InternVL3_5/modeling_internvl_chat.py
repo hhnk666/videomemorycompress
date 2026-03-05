@@ -149,7 +149,7 @@ class InternVLChatModel(PreTrainedModel):
         self.img_context_token_id = None
         self.conv_template = get_conv_template(self.template)
         self.system_message = self.conv_template.system_message
-        # --- 新增代码：用于流式处理的状态管理 ---
+        # New
         self.streaming_state = {
             "past_key_values": None,
             "fusion_counts": None,
@@ -157,12 +157,12 @@ class InternVLChatModel(PreTrainedModel):
             "logical_seq_len": 0,
             "logical_positions": 0,
         }
-        # 您可以在config中定义这些超参数，或直接硬编码
-        self.inter_frame_threshold = 0.75  # 帧间相似度阈值
-        self.intra_frame_threshold = 0.75  # 帧内合并阈值
-        self.kv_cache_token_limit = 6000  # KV缓存压缩目标
+
+        self.inter_frame_threshold = 0.75  # inter frame threshold
+        self.intra_frame_threshold = 0.75  # intra frame threshold
+        self.kv_cache_token_limit = 6000  # KV Size per layer
         self.kv_cache_token_limit_per_layer = self.kv_cache_token_limit
-        # --- 新增结束 ---
+        # end of fix 
         self.gsim_threshold = 0.5  # κ (kappa) for GSim gating
         self.gsim_temperature = 150  # τ (tau) for GSim softmax
 
@@ -263,7 +263,7 @@ class InternVLChatModel(PreTrainedModel):
 
     def reset_streaming_state(self):
         """
-        显式重置模型的流式处理状态。
+        reset the state of streaming
         """
         print("--- Resetting model streaming state for new sample ---")
         self.streaming_state = {
@@ -280,7 +280,7 @@ class InternVLChatModel(PreTrainedModel):
         max_iterations: int = 10
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        递归执行token合并，通过多次二分图合并最多可以砍掉7/8的tokens。
+        Recursively performs token merging as described in https://arxiv.org/pdf/2210.09461.
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
@@ -328,45 +328,44 @@ class InternVLChatModel(PreTrainedModel):
     @torch.no_grad()
     def _proxy_prefill_and_get_queries(self, past_key_values: Cache):
         """
-        [重构版] 为重要性评分生成代理查询（proxy queries）。
-        此版本使用安全的 API 访问 KV Cache，并为每一层动态生成正确的 Attention Mask 和
-        位置编码，以精确适应各层长度不一的复杂情况。
+        [Refactored version] Generates proxy queries for importance scoring.
+        This version uses safe APIs to access the KV Cache and dynamically generates 
+        correct Attention Masks and positional encodings for each layer, precisely 
+        accommodating complex scenarios where layers have varying lengths.
         """
         device = self.get_input_embeddings().weight.device
         proxy_ids = torch.tensor([[151645, 151644, 77091, 198]], device=device)
         proxy_embeds = self.get_input_embeddings()(proxy_ids)
         bsz, q_len, _ = proxy_embeds.shape
 
-        # 1. 创建一个临时的、安全的 pkv 副本用于模拟前向传播
+        # 1. Create a temporary, safe copy of pkv for simulating forward propagation
         pkv_clone = DynamicCache()
         if past_key_values is not None and past_key_values.get_seq_length(0) > 0:
-            # 遍历所有层，安全地填充副本
+            # Iterate through all layers to safely populate the copy
             for layer_idx in range(len(self.language_model.layers)):
-                # 使用官方 API [layer_idx] 安全地访问每一层的 k, v
                 k, v = past_key_values[layer_idx]
-                # 使用官方 API .update() 安全地填充副本，它会正确记录每一层的长度
                 pkv_clone.update(k.clone(), v.clone(), layer_idx)
 
         proxy_queries_per_layer = []
         hidden_states = proxy_embeds
 
-        # 2. 逐层模拟前向传播
+        # 2. Simulate forward propagation layer by layer
         for layer_idx, layer in enumerate(self.language_model.layers):
             layernorm_output = layer.input_layernorm(hidden_states)
 
-            # 3. 为当前层动态计算位置信息 (RoPE)
-            #    这是关键：每一层都有自己独立的 past_len
+            # 3. Dynamically compute positional information (RoPE) for the current layer
+            #    Key point: each layer has its own independent past_len
             current_past_len = pkv_clone.get_seq_length(layer_idx)
             proxy_pos_ids = torch.arange(
                 current_past_len, current_past_len + q_len, device=device
             ).view(1, -1)
 
-            # 您的 RoPE 计算逻辑 (假设 rotary_emb 和 apply_rotary_pos_emb 是正确的)
+            # RoPE computation logic (assuming rotary_emb and apply_rotary_pos_emb are correct)
             cos, sin = self.language_model.rotary_emb(
                 proxy_embeds, proxy_pos_ids)
             position_embeddings = (cos, sin)
 
-            # 4. 提取用于评分的旋转后查询向量 (q_rot)
+            # 4. Extract rotated query vectors (q_rot) for scoring
             q_vectors = layer.self_attn.q_proj(layernorm_output)
             q_vectors = q_vectors.view(
                 bsz, q_len, layer.self_attn.config.num_attention_heads, layer.self_attn.head_dim
@@ -374,7 +373,7 @@ class InternVLChatModel(PreTrainedModel):
             q_rot, _ = apply_rotary_pos_emb(q_vectors, q_vectors, cos, sin)
             proxy_queries_per_layer.append(q_rot)
 
-            # 5. 为当前层动态生成正确的 Attention Mask
+            # 5. Dynamically generate the correct Attention Mask for the current layer
             total_kv_len = current_past_len + q_len
             attention_mask = torch.zeros(
                 (bsz, 1, q_len, total_kv_len), dtype=hidden_states.dtype, device=device
@@ -389,18 +388,17 @@ class InternVLChatModel(PreTrainedModel):
                     causal_mask_bool, torch.finfo(hidden_states.dtype).min
                 )
 
-            # 6. 模拟完整的注意力计算，以更新 hidden_states 传给下一层
-            #    注意：pkv_clone 会在此调用中被内部更新
+            # 6. Simulate complete attention computation to update hidden_states for the next layer
+            #    Note: pkv_clone will be internally updated during this call
             attn_output, _ = layer.self_attn(
                 hidden_states=layernorm_output,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 past_key_values=pkv_clone,
                 use_cache=True,
-                cache_position=proxy_pos_ids  # cache_position 对于 DynamicCache 的更新至关重要
+                cache_position=proxy_pos_ids  
             )
 
-            # 模拟残差连接和 MLP
             hidden_states = hidden_states + attn_output
             hidden_states = hidden_states + \
                 layer.mlp(layer.post_attention_layernorm(hidden_states))
@@ -413,13 +411,14 @@ class InternVLChatModel(PreTrainedModel):
         in_frame_threshold: float
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        单次二分图合并，用合并后的向量替换目标位置，并返回被合并掉的token的索引。
-        此函数精确控制梯度：决策过程无梯度，合并过程有梯度。
+        Performs a single-step bipartite graph merge: replaces target positions with 
+        merged vectors and returns the indices of tokens that were merged away.
+        This function precisely controls gradient flow: the decision-making process 
+        is gradient-free, while the merging operation preserves gradients.
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
 
-        # --- 决策路径 (无梯度) ---
         frame_hs_detached = frame_hs.detach()
         metric_norm = frame_hs_detached / \
             frame_hs_detached.norm(dim=-1, keepdim=True)
@@ -440,7 +439,7 @@ class InternVLChatModel(PreTrainedModel):
         a_dropped_indices_relative = a_indices_relative[edge_idx]
         dropped_indices_relative = a_dropped_indices_relative * 2
 
-        # --- 合并路径 (有梯度) ---
+
         updated_frame_hs = frame_hs.clone()
         a_orig, b_orig = frame_hs[::2, :], frame_hs[1::2, :]
         merged_sum = torch.zeros_like(b_orig, dtype=frame_hs.dtype)
@@ -459,7 +458,7 @@ class InternVLChatModel(PreTrainedModel):
             counts[b_consumed_indices_relative].unsqueeze(
                 -1).to(frame_hs.dtype)
 
-        # --- 更新 ---
+
         original_b_consumed_indices = b_consumed_indices_relative * 2 + 1
         updated_frame_hs[original_b_consumed_indices] = final_merged_vectors
 
@@ -568,15 +567,11 @@ class InternVLChatModel(PreTrainedModel):
         Extracts visual features from pixel values.
         [FIX] Ensures that pixel_values are on the same device as the vision_model.
         """
-        # ==================== 关键修复 Start ====================
-        # 获取 vision_model 所在的设备
-        # self.vision_model.device 会返回第一个参数所在的设备
+
         model_device = self.vision_model.device
 
-        # 将 pixel_values 移动到与模型相同的设备和数据类型
         pixel_values = pixel_values.to(
             device=model_device, dtype=self.vision_model.dtype)
-        # ==================== 关键修复 End ======================
 
         if self.select_layer == -1:
             vit_embeds = self.vision_model(
@@ -720,16 +715,17 @@ class InternVLChatModel(PreTrainedModel):
     @torch.no_grad()
     def _proxy_prefill_and_get_queries(self, past_key_values: Cache):
         """
-        [v3 - Corrected Cache API] 为重要性评分生成代理查询（proxy queries）。
-        此版本使用安全的 API 访问 KV Cache，并为每一层动态生成正确的 Attention Mask 和
-        位置编码，以精确适应各层长度不一的复杂情况。
+        [v3 - Corrected Cache API] Generates proxy queries for importance scoring.
+        This version uses safe APIs to access the KV Cache and dynamically generates 
+        correct Attention Masks and positional encodings for each layer, precisely 
+        accommodating complex scenarios where layers have varying sequence lengths.
         """
         device = self.get_input_embeddings().weight.device
         proxy_ids = torch.tensor([[151645, 151644, 77091, 198]], device=device)
         proxy_embeds = self.get_input_embeddings()(proxy_ids)
         bsz, q_len, _ = proxy_embeds.shape
 
-        # 获取language model的layers
+        
         if hasattr(self.language_model, 'model'):
             layers = self.language_model.model.layers
             rotary_emb = self.language_model.model.rotary_emb
@@ -737,21 +733,19 @@ class InternVLChatModel(PreTrainedModel):
             layers = self.language_model.layers
             rotary_emb = self.language_model.rotary_emb
 
-        # 1. 创建一个临时的、安全的 pkv 副本用于模拟前向传播
+
         pkv_clone = DynamicCache()
         if past_key_values is not None and past_key_values.get_seq_length(layer_idx=0) > 0:
-            # ==================== 关键修复 Start ====================
-            # 使用 len(past_key_values) 来获取当前缓存的层数
+
             num_cached_layers = len(past_key_values)
             for layer_idx in range(min(len(layers), num_cached_layers)):
                 k, v = past_key_values[layer_idx]
                 pkv_clone.update(k.clone(), v.clone(), layer_idx=layer_idx)
-            # ==================== 关键修复 End ======================
 
         proxy_queries_per_layer = []
         hidden_states = proxy_embeds
 
-        # 2. 逐层模拟前向传播
+
         for layer_idx, layer in enumerate(layers):
             layernorm_output = layer.input_layernorm(hidden_states)
 
@@ -763,7 +757,7 @@ class InternVLChatModel(PreTrainedModel):
             cos, sin = rotary_emb(proxy_embeds, proxy_pos_ids)
 
             q_vectors = layer.self_attn.q_proj(layernorm_output)
-            # 使用 .config.num_attention_heads 访问
+
             q_vectors = q_vectors.view(
                 bsz, q_len, layer.self_attn.config.num_attention_heads, layer.self_attn.head_dim
             ).transpose(1, 2)
@@ -771,7 +765,7 @@ class InternVLChatModel(PreTrainedModel):
             q_rot, _ = apply_rotary_pos_emb(q_vectors, q_vectors, cos, sin)
             proxy_queries_per_layer.append(q_rot)
 
-            # 为了模拟传播，我们需要一个正确的 attention_mask
+
             total_kv_len = current_past_len + q_len
             attention_mask = torch.ones(
                 bsz, 1, q_len, total_kv_len, device=device, dtype=torch.bool)
@@ -779,7 +773,7 @@ class InternVLChatModel(PreTrainedModel):
             attention_mask = torch.where(
                 attention_mask, 0.0, -torch.inf).to(hidden_states.dtype)
 
-            # 模拟完整的注意力计算以更新 hidden_states
+
             attn_output, _ = layer.self_attn(
                 hidden_states=layernorm_output,
                 position_embeddings=(cos, sin),
@@ -789,7 +783,6 @@ class InternVLChatModel(PreTrainedModel):
                 cache_position=proxy_pos_ids
             )
 
-            # 模拟残差连接和 MLP
             hidden_states = hidden_states + attn_output
             hidden_states = hidden_states + \
                 layer.mlp(layer.post_attention_layernorm(hidden_states))
@@ -798,22 +791,18 @@ class InternVLChatModel(PreTrainedModel):
 
     def _compress_kv_cache(self):
         """
-        采用"均匀+固定比例+动态熵"三合一混合策略的KV Cache压缩。
-        - 30% 均匀分配，保证鲁棒性
-        - 35% 基于先验知识的固定比例分配
-        - 35% 基于当前上下文的动态熵分配
+        KV Cache compression using a 'Uniform + Fixed Ratio + Dynamic Entropy' triple-hybrid strategy.
         """
         pkv = self.streaming_state["past_key_values"]
         if pkv is None or pkv.get_seq_length(layer_idx=0) == 0:
             return
 
-        # 获取language model的layers
         if hasattr(self.language_model, 'model'):
             layers = self.language_model.model.layers
         else:
             layers = self.language_model.layers
 
-        # 1. 初始化和配置 (逻辑不变)
+        # 1. Initialization and Configuration
         try:
             kv_dtype = pkv.key_cache[0].dtype if hasattr(
                 pkv, 'key_cache') and pkv.key_cache else torch.bfloat16
@@ -834,7 +823,7 @@ class InternVLChatModel(PreTrainedModel):
         if current_total_len <= total_budget:
             return
 
-        # 2. 计算重要性得分和熵 (恢复熵的计算)
+        # 2. Calculate Importance Scores and Entropy
         pkv_clone = DynamicCache()
         if pkv.get_seq_length() > 0:
             for layer_idx in range(num_layers):
@@ -845,7 +834,7 @@ class InternVLChatModel(PreTrainedModel):
         num_kv_groups = layers[0].self_attn.num_key_value_groups
 
         layer_scores = []
-        layer_entropies = []  # <--- 恢复熵列表
+        layer_entropies = []  
 
         for layer_idx in range(num_layers):
             k_layer, v_layer = pkv[layer_idx]
@@ -859,7 +848,7 @@ class InternVLChatModel(PreTrainedModel):
 
                 fc_layer = fusion_counts[layer_idx]
                 if fc_layer.numel() == scores.numel():
-                    # 将 fc_layer 压缩至 [N] 以匹配 scores 的维度，防止错误的广播
+                    # Compress fc_layer to [N] to match scores dimensions, preventing incorrect broadcasting
                     if fc_layer.dim() > 1:
                         attention_bias = torch.log1p(
                             fc_layer.squeeze(0) - 1).to(scores.device, scores.dtype)
@@ -875,70 +864,63 @@ class InternVLChatModel(PreTrainedModel):
 
             layer_scores.append(scores)
 
-            # --- 恢复熵的计算逻辑 ---
+            # --- Restore Entropy Calculation Logic ---
             if scores.numel() > 0:
                 probs = F.softmax(scores.to(torch.float32), dim=0)
                 entropy = -torch.sum(probs * torch.log(probs + 1e-9))
             else:
                 entropy = torch.tensor(0.0, device=scores.device)
-            # 使用 v_norm 对熵进行加权，使其更关注值较大的token
+            # Weight entropy using v_norm to focus more on tokens with larger values
             layer_entropies.append(torch.log1p_(entropy) * log_v_norm.mean())
 
-        # 3. 动态预算分配 (采用三合一混合策略)
+        # 3. Dynamic Budget Allocation (Using Triple-Hybrid Strategy)
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
         new_fusion_counts = [None] * num_layers
         layer_lens = [pkv.get_seq_length(i) for i in range(num_layers)]
 
         if total_budget > 0:
-            # --- 核心修改部分: 三合一比例混合 ---
-
-            # 定义权重
             weight_uniform = 0.3
             weight_static = 0.6
             weight_entropy = 0.1
 
-            # 1. 均匀分配比例
             uniform_proportions = torch.full(
                 (num_layers,), 1.0 / num_layers, device=device)
 
-            # 2. 基于先验知识的固定比例
+
             static_ratios_list = [16.91, 11.62, 9.92, 8.35, 8, 7.8, 7.23, 6.33, 5.47, 4.94, 4.30, 3.53, 2.87,
                                   2.32, 1.93, 1.59, 1.24, 0.98, 0.53, 0.40, 0.29, 0.20, 0.15, 0.13, 0.11, 0.09, 0.07, 0.05]
             if len(static_ratios_list) != num_layers:
                 raise ValueError(
-                    f"提供的静态比例数量 ({len(static_ratios_list)})与模型层数 ({num_layers})不匹配。")
+                    f"The number of provided static ratios ({len(static_ratios_list)}) does not match the number of model layers ({num_layers}).")
             static_ratios_tensor = torch.tensor(
                 static_ratios_list, dtype=torch.float32, device=device)
             static_proportions = static_ratios_tensor / static_ratios_tensor.sum()
 
-            # 3. 基于动态熵的比例
             entropies_tensor = torch.stack(layer_entropies)
-            # 归一化熵值，使其不受尺度影响
             entropies_tensor = entropies_tensor - entropies_tensor.min()
             total_entropy = entropies_tensor.sum()
 
-            if total_entropy <= 1e-9:  # 边缘情况处理
+            if total_entropy <= 1e-9: 
                 entropy_proportions = uniform_proportions.clone()
             else:
                 entropy_proportions = entropies_tensor / total_entropy
 
-            # 4. 加权混合得到最终比例
             proportions_to_use = (weight_uniform * uniform_proportions +
                                   weight_static * static_proportions +
                                   weight_entropy * entropy_proportions)
-            # --- 修改结束 ---
+
 
             layer_lens_tensor = torch.tensor(layer_lens, device=device)
             num_to_keep = proportions_to_use * total_budget
 
-            # 修正超额分配 (逻辑不变)
+
             over_allocated_mask = num_to_keep > layer_lens_tensor.float()
             excess_budget = (num_to_keep[over_allocated_mask] -
                              layer_lens_tensor[over_allocated_mask].float()).sum()
             num_to_keep = torch.min(num_to_keep, layer_lens_tensor.float())
 
-            # 重新分配多余预算 (逻辑不变)
+
             if excess_budget > 0:
                 under_allocated_mask = ~over_allocated_mask
                 if under_allocated_mask.any():
@@ -952,7 +934,6 @@ class InternVLChatModel(PreTrainedModel):
                             redistribution, (capacity_under - current_under_values).float())
                         num_to_keep[under_allocated_mask] += final_additions
 
-            # 舍入处理 (逻辑不变)
             floored_keeps = num_to_keep.floor().long()
             remainder = int(total_budget - floored_keeps.sum())
             if remainder > 0:
@@ -969,9 +950,9 @@ class InternVLChatModel(PreTrainedModel):
 
         print(
             f"KV Cache compression budgets per layer: {budgets_for_all_layers}")
-        print(f"校验总和: {sum(budgets_for_all_layers)}")
 
-        # --- 4. 对每一层应用精英选择策略 ---
+
+
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
         new_fusion_counts = [None] * num_layers
@@ -991,10 +972,9 @@ class InternVLChatModel(PreTrainedModel):
             if budget_for_this_layer == 0:
                 new_keys[layer_idx] = torch.empty_like(k_layer[..., :0, :])
                 new_values[layer_idx] = torch.empty_like(v_layer[..., :0, :])
-                # ==================== BUG FIX #2 START ====================
-                # 移除 .squeeze(0) 以保持正确的二维形状 [1, 0]
+
                 new_fusion_counts[layer_idx] = fc_layer[..., :0]
-                # ==================== BUG FIX #2 END ======================
+
                 continue
 
             scores_this_layer = layer_scores[layer_idx]
@@ -1005,28 +985,22 @@ class InternVLChatModel(PreTrainedModel):
             new_keys[layer_idx] = k_layer.index_select(2, final_indices)
             new_values[layer_idx] = v_layer.index_select(2, final_indices)
 
-            # fc_layer 是一维张量，从维度 0 进行索引选择
             new_fusion_counts[layer_idx] = fc_layer.index_select(
                 0, final_indices)
 
-         # ==================== 核心 BUG 修复：安全地更新模型状态 ====================
-        # 1. 创建一个新的、空的 DynamicCache 对象
+
         new_cache = DynamicCache()
 
-        # 2. 遍历我们筛选出的 keys 和 values
+
         for i in range(num_layers):
-            # 只有当该层有需要保留的token时才进行更新
+
             if new_keys[i] is not None and new_keys[i].shape[2] > 0:
-                # 3. 使用官方的 update() 方法来安全地填充新cache
-                #    这个方法会正确处理每一层的内部状态，包括其独立的序列长度
+
                 new_cache.update(new_keys[i], new_values[i], layer_idx=i)
 
-        # 4. 用这个状态完全正确的新cache，替换掉模型流式状态中的旧cache
         self.streaming_state["past_key_values"] = new_cache
 
-        # 5. 更新 fusion_counts (这部分是简单的列表，可以直接替换)
         self.streaming_state["fusion_counts"] = new_fusion_counts
-        # ========================= 修复结束 ==========================
 
     @torch.no_grad()
     def generate(
@@ -1038,10 +1012,6 @@ class InternVLChatModel(PreTrainedModel):
             use_frame_prefill: bool = True,
             **generate_kwargs,
     ) -> torch.LongTensor:
-
-        # =====================================================================================
-        # 1. 非流式/原始逻辑 (保持不变)
-        # =====================================================================================
         if not use_frame_prefill or input_ids.shape[1] <= 1 or input_ids.shape[0] > 1:
             if pixel_values is not None:
                 inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
@@ -1064,13 +1034,11 @@ class InternVLChatModel(PreTrainedModel):
                 **generate_kwargs,
             )
 
-        # =================================================================
-        # --- [v7 - Final API-Compliant] Full Manual Streaming Generation ---
-        # =================================================================
+
         print("\n=== Streaming Mode with Token & Cache Compression (v7) ===")
         from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList
 
-        # 1. 准备配置和辅助工具
+        # 1. Prepare configuration and utilities
         has_default_max_length = 'max_length' not in generate_kwargs
         gen_config, model_kwargs = self.language_model._prepare_generation_config(
             generation_config, **generate_kwargs)
@@ -1092,12 +1060,12 @@ class InternVLChatModel(PreTrainedModel):
             generation_config=gen_config, stopping_criteria=StoppingCriteriaList()
         )
 
-        # 2. 重置状态并提取视觉特征
+        # 2. Reset state and extract visual features
         self.reset_streaming_state()
         vit_embeds = self.extract_feature(pixel_values).view(
             -1, self.language_model.config.hidden_size) if pixel_values is not None else None
 
-        # 3. 分块并执行流式 Prefill
+        # 3. Chunk and execute streaming Prefill
         input_ids_cpu = input_ids.squeeze(0).cpu()
         is_image_mask = (input_ids_cpu == self.img_context_token_id)
         change_mask = (is_image_mask[1:] != is_image_mask[:-1])
@@ -1118,7 +1086,7 @@ class InternVLChatModel(PreTrainedModel):
         vit_embeds_offset = 0
         hidden_states = None
 
- # ... --- Prefill Loop ---
+
         for chunk in chunks:
             self._compress_kv_cache()
 
@@ -1132,7 +1100,7 @@ class InternVLChatModel(PreTrainedModel):
                 processed = self._process_visual_chunk(
                     frame_embeds, original_indices)
                 processed_embeds = processed["embeds"]
-                # 确保一维
+                # Ensure 1D
                 processed_fusion_counts = processed["fusion_counts"].view(-1)
             else:
                 processed_embeds = self.language_model.get_input_embeddings()(
@@ -1143,34 +1111,32 @@ class InternVLChatModel(PreTrainedModel):
             if processed_embeds.shape[1] == 0:
                 continue
 
-            # ==================== 核心 BUG 修复：手动逐层执行 Prefill ====================
+            # ==================== Manual Layer-by-Layer Prefill Execution ====================
             pkv = self.streaming_state["past_key_values"]
             q_len = processed_embeds.shape[1]
 
-            # 1. 准备共享的位置编码 (Position Embeddings)
-            #    `logical_seq_len` 跟踪的是未压缩前的逻辑序列长度
+            # 1. Prepare shared Position Embeddings
             past_kv_len = self.streaming_state["logical_seq_len"]
             position_ids = torch.arange(
                 past_kv_len, past_kv_len + q_len, device=self.device).unsqueeze(0)
 
-            # RoPE编码只需计算一次，然后传递给所有层
+            # RoPE encoding only needs to be computed once, then passed to all layers
             position_embeddings = self.language_model.model.rotary_emb(
                 processed_embeds, position_ids)
 
-            # 2. 初始化 hidden_states
-            #    hidden_states 会在每一层之间传递和更新
+            # 2. Initialize hidden_states
             current_hidden_states = processed_embeds
 
-            # 3. 手动遍历每一层
+            # 3. Manually iterate through each layer
             model_layers = self.language_model.model.layers
             fusion_counts_history = self.streaming_state["fusion_counts"]
 
             for layer_idx, layer in enumerate(model_layers):
-                # a. 为当前层创建专属的、尺寸正确的注意力掩码
+                
                 combined_fc = torch.cat(
                     [fusion_counts_history[layer_idx].view(-1), processed_fusion_counts])
 
-                # `pkv.get_seq_length(layer_idx)` 获取的是该层压缩后的真实物理长度
+                #pkv.get_seq_length(layer_idx)retrieves the actual physical length of this layer after compression
                 attn_bias = self._create_streaming_attention_mask(
                     q_len=q_len,
                     past_kv_len=pkv.get_seq_length(layer_idx),
@@ -1179,36 +1145,35 @@ class InternVLChatModel(PreTrainedModel):
                     dtype=processed_embeds.dtype
                 )
 
-                # b. 调用单层的 forward 方法
-                #    注意：这里的 `use_cache=True` 会让 pkv 自动更新
+                # Note: Settinguse_cache=Truehere triggers automatic pkv updates
                 current_hidden_states = layer(
                     hidden_states=current_hidden_states,
                     attention_mask=attn_bias,
                     position_ids=position_ids,
                     past_key_values=pkv,
                     use_cache=True,
-                    cache_position=position_ids,  # `cache_position` 对 DynamicCache 很重要
+                    cache_position=position_ids,  
                     position_embeddings=position_embeddings,
                 )
 
-            # 4. 更新全局状态
-            #    a. 更新 fusion_counts 历史记录
+            # 4. Update global state
+            # a. Update fusion_counts history
             for i in range(len(fusion_counts_history)):
                 fusion_counts_history[i] = torch.cat(
                     [fusion_counts_history[i], processed_fusion_counts])
 
-            #    b. 更新逻辑序列长度
+            # b. Update logical sequence length
             self.streaming_state["logical_seq_len"] += q_len
 
-            #    c. 将最后一层的输出作为下一次迭代的输入
+            # c. Feed the final layer's output as input for the next iteration
             hidden_states = current_hidden_states
 
-        # 4. 自回归生成循环
+        # 4. Autoregressive generation loop
         if hidden_states is None:
-            # 如果预填充后没有任何输出（例如，输入只有图像块且全部被丢弃），则直接返回
+            # If no output exists after prefill... return immediately
             return input_ids
 
-        # a. 预填充结束后，为第一个解码步骤计算 logits
+        # a. Compute logits for the first decoding step following prefill completion
         last_hidden_state_normalized = self.language_model.model.norm(
             hidden_states)
         last_token_hidden_state = last_hidden_state_normalized[:, -1, :]
@@ -1216,69 +1181,64 @@ class InternVLChatModel(PreTrainedModel):
             last_token_hidden_state)
 
         generated_ids = input_ids
-        print(f'逻辑序列长度 (prefill后): {self.streaming_state["logical_seq_len"]}')
 
         while True:
             if stopping_criteria(generated_ids, None):
                 break
 
-            # b. 使用 logits 处理器（处理采样、top-k等）并选择下一个 token
+            # b. Apply logits processor... to select the next token
             next_token_scores = logits_processor(
                 generated_ids, next_token_logits)
             next_tokens = torch.argmax(next_token_scores, dim=-1, keepdim=True)
             generated_ids = torch.cat([generated_ids, next_tokens], dim=-1)
 
-            # ==================== 最终Bug修复：手动逐层执行 Decoding ====================
             pkv = self.streaming_state["past_key_values"]
             model_layers = self.language_model.model.layers
             fusion_counts_history = self.streaming_state["fusion_counts"]
 
-            # c. 准备所有层在本次解码步骤中共享的输入
+            # c. Prepare shared inputs across all layers for this decoding step
             next_position_ids = torch.tensor(
                 [[self.streaming_state["logical_seq_len"]]], device=self.device)
             next_token_embeds = self.language_model.get_input_embeddings()(next_tokens)
 
-            # 为当前这一个 token 计算 RoPE
+            # Compute RoPE for the current token
             position_embeddings = self.language_model.model.rotary_emb(
                 next_token_embeds, next_position_ids)
 
-            # d. 初始化当前解码步骤的 hidden_states
+            # d. Initialize hidden_states for the current decoding step
             current_hidden_states = next_token_embeds
 
-            # e. 手动遍历每一层，就像在预填充时一样
+            # e. Iterate through each layer manually, mirroring the prefill process
             for layer_idx, layer in enumerate(model_layers):
-                # i. 为当前层创建专属的、尺寸正确的注意力掩码
+                # fusion_counts must be one-dimensional
                 new_fc_token = torch.tensor([1.0], device=self.device)
-                # fusion_counts 必须是一维的
                 combined_fc = torch.cat(
                     [fusion_counts_history[layer_idx].view(-1), new_fc_token])
 
-                # `pkv.get_seq_length(layer_idx)` 获取该层压缩后的真实物理长度
                 attn_bias = self._create_streaming_attention_mask(
-                    q_len=1,  # 解码时 query 长度总是 1
+                    q_len=1,  
                     past_kv_len=pkv.get_seq_length(layer_idx),
                     combined_fusion_counts=combined_fc,
                     device=self.device, dtype=next_token_embeds.dtype
                 )
 
-                # ii. 调用单层的 forward 方法
                 current_hidden_states = layer(
                     hidden_states=current_hidden_states,
                     attention_mask=attn_bias,
                     position_ids=next_position_ids,
-                    past_key_values=pkv,  # pkv 会在此调用中被内部更新
+                    past_key_values=pkv,  
                     use_cache=True,
                     cache_position=next_position_ids,
                     position_embeddings=position_embeddings,
                 )
 
-            # f. 所有层处理完毕后，应用最终的 LayerNorm 和 lm_head
+            # f. After processing all layers, apply the final LayerNorm and lm_head
             last_hidden_state_normalized_decode = self.language_model.model.norm(
                 current_hidden_states)
             next_token_logits = self.language_model.lm_head(
                 last_hidden_state_normalized_decode).squeeze(1)
 
-            # g. 更新全局状态，为下一次解码做准备
+            # g. Update global state to prepare for the next decoding iteration
             new_fc_token_update = torch.tensor([1.0], device=self.device)
             for i in range(len(fusion_counts_history)):
                 fusion_counts_history[i] = torch.cat(
