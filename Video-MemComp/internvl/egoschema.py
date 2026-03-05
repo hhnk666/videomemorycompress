@@ -18,29 +18,24 @@ from decord import VideoReader, cpu
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 
-# --- 确保自定义模型定义在Python路径中 ---
-# 将 'InternVL3_5' 替换为包含您模型定义的实际模块路径
+# --- Ensure custom model definitions are in Python path ---
+# Replace 'InternVL3_5' with the actual module path containing your model definitions
 sys.path.append(osp.abspath(osp.join(osp.dirname(__file__), '..')))
 try:
     from InternVL3_5 import InternVLChatModel
 except ImportError as e:
-    print(f"Import Error: 无法访问 'InternVL3_5' 模块。将使用HuggingFace的AutoModel。")
-    print(f"详情: {e}")
     from transformers import AutoModelForCausalLM as InternVLChatModel
 
-# --- 日志设置 ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 fmt_str = "%(asctime)s %(levelname)5s | %(message)s"
 fmt = logging.Formatter(fmt_str)
 
-# --- EgoSchema 提示模板 ---
 prompt_template = """Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, D, or E) of the correct option.
 {question}
 Options: {options}
 The best answer is:"""
 
-# --- InternVL 视频处理函数 (与之前相同) ---
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -119,12 +114,10 @@ def load_video(video_path, num_segments=64, input_size=448, max_num=1):
 
         return torch.cat(pixel_values_list), num_patches_list
     except Exception as e:
-        logger.error(f"加载视频失败 {video_path}: {e}")
         return None, None
 
 
-# --- 辅助函数 (与之前相同) ---
-def extract_characters_regex(s):
+def extract_characters_regex():
     s = s.strip()
     answer_prefixes = ["The best answer is", "The correct answer is", "The answer is", "The answer",
                        "The best option is", "The correct option is", "Best answer:", "Best option:"]
@@ -142,21 +135,20 @@ def extract_characters_regex(s):
 
 def create_submission_file(result_jsonl_path, save_dir):
     if not osp.exists(result_jsonl_path):
-        return logger.error(f"结果文件未找到: {result_jsonl_path}")
+        return logger.error(f"Result file not found: {result_jsonl_path}")
     results = [json.loads(line) for line in open(
         result_jsonl_path, 'r', encoding='utf-8')]
-    # EgoSchema的q_uid就是question_idx
+    # EgoSchema's q_uid is the question_idx
     submission_data = [{'q_uid': r['q_uid'], 'answer': ord(
         r.get('pred_choice', 'A')) - ord('A')} for r in results]
     submission_df = pd.DataFrame(submission_data)
     submission_path = osp.join(save_dir, 'submission.csv')
     submission_df.to_csv(submission_path, index=False)
-    logger.info(f"EgoSchema 提交文件已创建: {submission_path}")
 
 
 def evaluate_with_subset(result_jsonl_path, subset_answers_path):
     if not all([osp.exists(result_jsonl_path), osp.exists(subset_answers_path)]):
-        return logger.error("评估所需文件不存在。")
+        return logger.error("Files required for evaluation do not exist.")
     with open(subset_answers_path, 'r', encoding='utf-8') as f:
         ground_truths = json.load(f)
     predictions = {data['video_id']: ord(data['pred_choice']) - ord('A') for line in open(
@@ -170,32 +162,31 @@ def evaluate_with_subset(result_jsonl_path, subset_answers_path):
     if total_evaluated > 0:
         accuracy = (correct_count / total_evaluated) * 100
         logger.info(
-            f"--- EgoSchema 子集评估结果 ---\n正确预测数: {correct_count}\n已评估问题数: {total_evaluated}\n准确率: {accuracy:.2f}%\n------------------------------------")
+            f"--- EgoSchema Subset Evaluation Results ---\nCorrect predictions: {correct_count}\nQuestions evaluated: {total_evaluated}\nAccuracy: {accuracy:.2f}%\n------------------------------------")
     else:
-        logger.error("评估失败：模型预测结果中没有与子集答案匹配的项。")
+        logger.error("Evaluation failed: No model predictions match the subset answers.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="EgoSchema 数据集上的单卡评估脚本 (InternVL)")
+        description="Single-GPU evaluation script for EgoSchema dataset (InternVL)")
     parser.add_argument("--run_name", type=str, required=True)
     parser.add_argument("--ckpt_path", type=str,
-                        required=True, help="指向 InternVL-3.5 模型权重的路径")
+                        required=True, help="Path to InternVL-3.5 model weights")
     parser.add_argument("--anno_path", type=str, required=True,
-                        help="指向 EgoSchema 的 full.json 文件")
+                        help="Path to EgoSchema's full.json file")
     parser.add_argument("--video_dir", type=str, required=True)
     parser.add_argument("--result_dir", type=str,
                         default="eval/result_egoschema_internvl")
-    parser.add_argument("--nframes", type=int, default=64, help="固定的采样帧数")
+    parser.add_argument("--nframes", type=int, default=64, help="Fixed number of sampled frames")
     parser.add_argument("--eval_subset_only", action="store_true",
-                        help="如果设置，仅在 subset_answers.json 定义的子集上运行")
+                        help="If set, only run on the subset defined in subset_answers.json")
     parser.add_argument("--subset_answers_path", type=str,
                         default="/home/nyh/EgoSchema/subset_answers.json")
     parser.add_argument("--resume_path", type=str, default="",
-                        help="用于恢复中断运行的输出文件路径 (例如 /path/to/output.jsonl)")
+                        help="Path to output file for resuming interrupted run (e.g., /path/to/output.jsonl)")
     args = parser.parse_args()
 
-    # --- 路径和日志设置 ---
     os.makedirs(args.result_dir, exist_ok=True)
     for subdir in ['output', 'log']:
         os.makedirs(osp.join(args.result_dir, subdir), exist_ok=True)
@@ -204,7 +195,7 @@ def main():
     base_name = f"{args.run_name}_{curr_time}"
     log_path = osp.join(args.result_dir, 'log', f"{base_name}.log")
 
-    # 如果是恢复运行，则使用恢复文件的基本名
+    # If resuming a run, use the basename of the resume file
     if args.resume_path:
         base_name = osp.splitext(osp.basename(args.resume_path))[0]
         log_path = osp.join(args.result_dir, 'log', f"{base_name}.log")
@@ -214,25 +205,18 @@ def main():
     logger.addHandler(file_handler)
     logger.addHandler(logging.StreamHandler(sys.stdout))
 
-    logger.info("--- 评测进程已启动 ---")
-    logger.info(f"运行配置: {vars(args)}")
-
-    # --- 模型和 Tokenizer 加载 ---
     torch.manual_seed(1234)
-    logger.info("正在加载模型和Tokenizer...")
     model = InternVLChatModel.from_pretrained(
         args.ckpt_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-        use_flash_attn=False,  # 根据您的环境和硬件调整
+        use_flash_attn=False,  
         device_map="auto"
     ).eval()
     tokenizer = AutoTokenizer.from_pretrained(
         args.ckpt_path, trust_remote_code=True, use_fast=False)
-    logger.info("模型和 Tokenizer 加载成功。")
 
-    # --- 数据加载 ---
     with open(args.anno_path, 'r', encoding='utf-8') as f:
         full_data = json.load(f)
     flattened_data = []
@@ -242,7 +226,6 @@ def main():
         for conv in video_info['conversations']:
             video_path = osp.join(args.video_dir, f"{video_id}.mp4")
             if not osp.exists(video_path):
-                logger.warning(f"视频文件未找到，跳过: {video_path}")
                 continue
             flattened_data.append({'video_id': video_id, 'video_path': video_path,
                                   'q_uid': conv['question_idx'], 'question': conv['question'], 'choices': conv['choices']})
@@ -253,9 +236,9 @@ def main():
         original_count = len(flattened_data)
         flattened_data = [
             d for d in flattened_data if d['video_id'] in subset_ids]
-        logger.info(f"数据集已从 {original_count} 条过滤至 {len(flattened_data)} 条。")
+        logger.info(f"Dataset filtered from {original_count} items to {len(flattened_data)} items.")
 
-    # --- 断点续跑逻辑 ---
+    # --- Checkpoint/resume logic ---
     output_jsonl_path = args.resume_path if args.resume_path else osp.join(
         args.result_dir, 'output', f"{base_name}.jsonl")
 
@@ -271,9 +254,9 @@ def main():
     data_to_process = [
         item for item in flattened_data if item['q_uid'] not in completed_q_uids]
     logger.info(
-        f"任务过滤后: 剩余 {len(data_to_process)} / 总计 {len(flattened_data)} 个任务。")
+        f"After filtering: {len(data_to_process)} / {len(flattened_data)} tasks remaining.")
 
-    # --- 推理循环 ---
+    # --- Inference loop ---
     generation_config = dict(max_new_tokens=32, do_sample=False)
     for item in tqdm(data_to_process, desc="Inference Progress"):
         try:
@@ -304,13 +287,12 @@ def main():
             with open(output_jsonl_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(output_dict, ensure_ascii=False) + '\n')
         except Exception as e:
-            logger.error(f"处理 q_uid {item['q_uid']} 时出错: {e}")
+            logger.error(f"Error processing q_uid {item['q_uid']}: {e}")
             traceback.print_exc()
 
-    logger.info(f"推理完成。所有结果已保存至: {output_jsonl_path}")
+    logger.info(f"Inference complete. All results saved to: {output_jsonl_path}")
 
-    # --- 最终评估 ---
-    logger.info("--- 开始最终评估... ---")
+
     evaluate_with_subset(output_jsonl_path, args.subset_answers_path)
     if not args.eval_subset_only:
         create_submission_file(output_jsonl_path, args.result_dir)
