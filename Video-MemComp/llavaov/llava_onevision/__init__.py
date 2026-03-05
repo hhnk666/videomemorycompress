@@ -24,13 +24,10 @@ if TYPE_CHECKING:
     from .qwen2 import Qwen2Attention
 else:
     import sys
-
-    # 简化导入，直接导入而不使用 lazy loading
     from .configuration_llava_onevision import *
     from .modeling_llava_onevision import *
     from .modeling_llava_onevision import LlavaOnevisionForConditionalGeneration
     from .qwen2 import Qwen2Attention
-    # 保留原来的 lazy loading 作为备用
     # _file = globals()["__file__"]
     # sys.modules[__name__] = _LazyModule(
     #     __name__, _file, define_import_structure(_file), module_spec=__spec__)
