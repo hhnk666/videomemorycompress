@@ -286,7 +286,7 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         self.language_model = Qwen2Model(config.text_config)
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
-        # --- 新增代码：用于流式处理的状态管理 ---
+        # new
         self.streaming_state = {
             "past_key_values": None,
             "fusion_counts": None,
@@ -294,13 +294,10 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
             "logical_seq_len": 0,
             "logical_positions": 0,
         }
-        # 您可以在config中定义这些超参数，或直接硬编码
         self.inter_frame_threshold = 0.75
-        # 帧间相似度阈值
-        self.intra_frame_threshold = 0.8  # 帧内合并阈值
-        self.kv_cache_token_limit = 6000  # KV缓存压缩目标
+        self.intra_frame_threshold = 0.8  # intra frame threshold
+        self.kv_cache_token_limit = 6000  # KV size per layer
         self.kv_cache_token_limit_per_layer = self.kv_cache_token_limit
-        # --- 新增结束 ---
         self.gsim_threshold = 0.5  # κ (kappa) for GSim gating
         self.gsim_temperature = 150  # τ (tau) for GSim softmax
 
@@ -308,7 +305,7 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
     def reset_streaming_state(self):
         """
-        显式重置模型的流式处理状态。
+        reset the state of streaming
         """
         print("--- Resetting model streaming state for new sample ---")
         self.streaming_state = {
@@ -323,9 +320,10 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
     @torch.no_grad()
     def _proxy_prefill_and_get_queries(self, past_key_values: Cache):
         """
-        [重构版] 为重要性评分生成代理查询（proxy queries）。
-        此版本使用安全的 API 访问 KV Cache，并为每一层动态生成正确的 Attention Mask 和
-        位置编码，以精确适应各层长度不一的复杂情况。
+        [Refactored Version] Generate proxy queries for importance scoring.
+        This version uses safe API access to KV Cache and dynamically generates correct 
+        Attention Masks and position encodings for each layer to precisely adapt to 
+        complex scenarios where layer lengths vary.
         """
         device = self.get_input_embeddings().weight.device
         proxy_ids = torch.tensor([[151645, 151644, 77091, 198]], device=device)
@@ -336,33 +334,31 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
             past_len, past_len + q_len, device=device
         ).unsqueeze(0)
         fusion_counts_history = self.streaming_state["fusion_counts"]
-        # 1. 创建一个临时的、安全的 pkv 副本用于模拟前向传播
+        # 1. Create a temporary, safe pkv clone for simulating forward propagation
         pkv_clone = DynamicCache()
         if past_key_values is not None and past_key_values.get_seq_length(0) > 0:
-            # 遍历所有层，安全地填充副本
+            # Iterate through all layers to safely populate the clone
             for layer_idx in range(len(self.language_model.layers)):
-                # 使用官方 API [layer_idx] 安全地访问每一层的 k, v
                 k, v = past_key_values[layer_idx]
-                # 使用官方 API .update() 安全地填充副本，它会正确记录每一层的长度
                 pkv_clone.update(k.clone(), v.clone(), layer_idx)
 
         proxy_queries_per_layer = []
         hidden_states = proxy_embeds
 
-        # 2. 逐层模拟前向传播
+        # 2. Simulate forward propagation layer by layer
         for layer_idx, layer in enumerate(self.language_model.layers):
             layernorm_output = layer.input_layernorm(hidden_states)
 
-            # 3. 为当前层动态计算位置信息 (RoPE)
-            #    这是关键：每一层都有自己独立的 past_len
+            # 3. Dynamically compute position information (RoPE) for current layer
+            #    This is critical: each layer has its own independent past_len
             current_past_len = pkv_clone.get_seq_length(layer_idx)
 
-            # 您的 RoPE 计算逻辑 (假设 rotary_emb 和 apply_rotary_pos_emb 是正确的)
+            # Your RoPE computation logic (assuming rotary_emb and apply_rotary_pos_emb are correct)
             cos, sin = self.language_model.rotary_emb(
                 proxy_embeds, proxy_pos_ids)
             position_embeddings = (cos, sin)
 
-            # 4. 提取用于评分的旋转后查询向量 (q_rot)
+            # 4. Extract rotation-applied query vectors (q_rot) for scoring
             q_vectors = layer.self_attn.q_proj(layernorm_output)
             q_vectors = q_vectors.view(
                 bsz, q_len, layer.self_attn.config.num_attention_heads, layer.self_attn.head_dim
@@ -372,7 +368,6 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
             total_kv_len = current_past_len + q_len
 
-            # 创建基础掩码（只含因果关系）
             attention_mask = torch.zeros(
                 (bsz, 1, q_len, total_kv_len), dtype=hidden_states.dtype, device=device
             )
@@ -384,39 +379,34 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
                     causal_mask_bool, torch.finfo(hidden_states.dtype).min
                 )
 
-            # 【新增】添加 fusion_counts 偏置
+            # [Added] Add fusion_counts bias
             if layer_idx < len(fusion_counts_history):
                 fc_layer = fusion_counts_history[layer_idx]
                 if fc_layer is not None and fc_layer.numel() > 0:
-                    # 确保 fc_layer 是 [1, L] 的形状
                     if fc_layer.dim() == 1:
                         fc_layer = fc_layer.unsqueeze(0)
-
-                    # 计算偏置
                     attention_bias = torch.log1p(
                         fc_layer - 1).to(attention_mask.dtype)
-                    # 调整形状以进行广播 [1, 1, 1, L]
                     attention_bias = attention_bias.unsqueeze(1).unsqueeze(1)
 
-                    # 将偏置加到掩码的 K/V 部分
                     bias_len = min(current_past_len, attention_bias.shape[-1])
                     if bias_len > 0:
                         attention_mask[..., :,
                                        :bias_len] += attention_bias[..., :bias_len]
             cache_pos = torch.arange(
-                current_past_len, current_past_len + q_len, device=device).unsqueeze(0)  # 关键：告诉注意力模块缓存位置
-            # 6. 模拟完整的注意力计算，以更新 hidden_states 传给下一层
-            #    注意：pkv_clone 会在此调用中被内部更新
+                current_past_len, current_past_len + q_len, device=device).unsqueeze(0)  
+            # 6. Simulate complete attention computation to update hidden_states for next layer
+            #    Note: pkv_clone will be internally updated during this call
             attn_output, _ = layer.self_attn(
                 hidden_states=layernorm_output,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 past_key_values=pkv_clone,
                 use_cache=True,
-                cache_position=cache_pos  # cache_position 对于 DynamicCache 的更新至关重要
+                cache_position=cache_pos  
             )
 
-            # 模拟残差连接和 MLP
+            # Simulate residual connection and MLP
             hidden_states = hidden_states + attn_output
             hidden_states = hidden_states + \
                 layer.mlp(layer.post_attention_layernorm(hidden_states))
@@ -429,13 +419,14 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         in_frame_threshold: float
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        单次二分图合并，用合并后的向量替换目标位置，并返回被合并掉的token的索引。
-        此函数精确控制梯度：决策过程无梯度，合并过程有梯度。
+        Single bipartite graph merge: replace target position with merged vector 
+        and return indices of merged-away tokens.
+        This function precisely controls gradients: decision process has no gradient, 
+        merge process has gradient.
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
 
-        # --- 决策路径 (无梯度) ---
         frame_hs_detached = frame_hs.detach()
         metric_norm = frame_hs_detached / \
             frame_hs_detached.norm(dim=-1, keepdim=True)
@@ -456,7 +447,6 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         a_dropped_indices_relative = a_indices_relative[edge_idx]
         dropped_indices_relative = a_dropped_indices_relative * 2
 
-        # --- 合并路径 (有梯度) ---
         updated_frame_hs = frame_hs.clone()
         a_orig, b_orig = frame_hs[::2, :], frame_hs[1::2, :]
         merged_sum = torch.zeros_like(b_orig, dtype=frame_hs.dtype)
@@ -475,7 +465,6 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
             counts[b_consumed_indices_relative].unsqueeze(
                 -1).to(frame_hs.dtype)
 
-        # --- 更新 ---
         original_b_consumed_indices = b_consumed_indices_relative * 2 + 1
         updated_frame_hs[original_b_consumed_indices] = final_merged_vectors
 
@@ -484,16 +473,13 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
     def _compress_kv_cache(self):
         """
-        采用"均匀+固定比例+动态熵"三合一混合策略的KV Cache压缩。
-        - 30% 均匀分配，保证鲁棒性
-        - 35% 基于先验知识的固定比例分配
-        - 35% 基于当前上下文的动态熵分配
+        KV Cache compression using a "uniform + fixed-ratio + dynamic entropy" three-in-one hybrid strategy.
         """
         pkv = self.streaming_state["past_key_values"]
         if pkv is None or pkv.get_seq_length(layer_idx=0) == 0:
             return
 
-        # 1. 初始化和配置 (逻辑不变)
+        # 1. Initialization and configuration 
         try:
             kv_dtype = pkv.key_cache[0].dtype if hasattr(
                 pkv, 'key_cache') and pkv.key_cache else torch.bfloat16
@@ -515,7 +501,7 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         if current_total_len <= total_budget:
             return
 
-        # 2. 计算重要性得分和熵 (恢复熵的计算)
+        # 2. Compute importance scores and entropy (restore entropy computation)
         pkv_clone = DynamicCache()
         if pkv.get_seq_length() > 0:
             for layer_idx in range(num_layers):
@@ -526,7 +512,7 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         num_kv_groups = self.language_model.layers[0].self_attn.num_key_value_groups
 
         layer_scores = []
-        layer_entropies = []  # <--- 恢复熵列表
+        layer_entropies = []  
 
         for layer_idx in range(num_layers):
             k_layer, v_layer = pkv[layer_idx]
@@ -540,7 +526,6 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
                 fc_layer = fusion_counts[layer_idx]
                 if fc_layer.numel() == scores.numel():
-                    # 将 fc_layer 从 [1, N] 压缩至 [N] 以匹配 scores 的维度，防止错误的广播
                     attention_bias = torch.log1p(
                         fc_layer.squeeze(0) - 1).to(scores.device, scores.dtype)
                     scores = scores+torch.sqrt_(attention_bias+1)
@@ -552,70 +537,56 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
             layer_scores.append(scores)
 
-            # --- 恢复熵的计算逻辑 ---
             if scores.numel() > 0:
                 probs = F.softmax(scores.to(torch.float32), dim=0)
                 entropy = -torch.sum(probs * torch.log(probs + 1e-9))
             else:
                 entropy = torch.tensor(0.0, device=scores.device)
-            # 使用 v_norm 对熵进行加权，使其更关注值较大的token
             layer_entropies.append(torch.log1p_(entropy) * log_v_norm.mean())
 
-        # 3. 动态预算分配 (采用三合一混合策略)
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
         new_fusion_counts = [None] * num_layers
         layer_lens = [pkv.get_seq_length(i) for i in range(num_layers)]
 
         if total_budget > 0:
-            # --- 核心修改部分: 三合一比例混合 ---
-
-            # 定义权重
             weight_uniform = 0.4
             weight_static = 0.575
             weight_entropy = 1-weight_uniform-weight_static
-
-            # 1. 均匀分配比例
             uniform_proportions = torch.full(
                 (num_layers,), 1.0 / num_layers, device=device)
-
-            # 2. 基于先验知识的固定比例
             static_ratios_list = [42, 40, 39, 39, 39, 39, 39, 40, 43, 45, 47,
                                   50, 50, 50, 50, 49, 46, 43, 40, 37, 33, 28, 25, 21, 18, 14, 11, 7]
             if len(static_ratios_list) != num_layers:
                 raise ValueError(
-                    f"提供的静态比例数量 ({len(static_ratios_list)})与模型层数 ({num_layers})不匹配。")
+                    f"Provided static ratio count ({len(static_ratios_list)}) does not match model layer count ({num_layers}).")
             static_ratios_tensor = torch.tensor(
                 static_ratios_list, dtype=torch.float32, device=device)
             static_proportions = static_ratios_tensor / static_ratios_tensor.sum()
 
-            # 3. 基于动态熵的比例
+            # 3. Dynamic entropy-based ratio
             entropies_tensor = torch.stack(layer_entropies)
-            # 归一化熵值，使其不受尺度影响
+            # Normalize entropy values to be scale-invariant
             entropies_tensor = entropies_tensor - entropies_tensor.min()
             total_entropy = entropies_tensor.sum()
 
-            if total_entropy <= 1e-9:  # 边缘情况处理
+            if total_entropy <= 1e-9:  
                 entropy_proportions = uniform_proportions.clone()
             else:
                 entropy_proportions = entropies_tensor / total_entropy
 
-            # 4. 加权混合得到最终比例
+            # 4. Weighted mixing to get final proportions
             proportions_to_use = (weight_uniform * uniform_proportions +
                                   weight_static * static_proportions +
                                   weight_entropy * entropy_proportions)
-            # --- 修改结束 ---
 
             layer_lens_tensor = torch.tensor(layer_lens, device=device)
             num_to_keep = proportions_to_use * total_budget
-
-            # 修正超额分配 (逻辑不变)
             over_allocated_mask = num_to_keep > layer_lens_tensor.float()
             excess_budget = (num_to_keep[over_allocated_mask] -
                              layer_lens_tensor[over_allocated_mask].float()).sum()
             num_to_keep = torch.min(num_to_keep, layer_lens_tensor.float())
 
-            # 重新分配多余预算 (逻辑不变)
             if excess_budget > 0:
                 under_allocated_mask = ~over_allocated_mask
                 if under_allocated_mask.any():
@@ -629,7 +600,6 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
                             redistribution, (capacity_under - current_under_values).float())
                         num_to_keep[under_allocated_mask] += final_additions
 
-            # 舍入处理 (逻辑不变)
             floored_keeps = num_to_keep.floor().long()
             remainder = int(total_budget - floored_keeps.sum())
             if remainder > 0:
@@ -646,9 +616,8 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
         print(
             f"KV Cache compression budgets per layer: {budgets_for_all_layers}")
-        print(f"校验总和: {sum(budgets_for_all_layers)}")
+        print(f"Verification sum: {sum(budgets_for_all_layers)}")
 
-        # --- 4. 对每一层应用精英选择策略 ---
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
         new_fusion_counts = [None] * num_layers
@@ -668,7 +637,6 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
             if budget_for_this_layer == 0:
                 new_keys[layer_idx] = torch.empty_like(k_layer[..., :0, :])
                 new_values[layer_idx] = torch.empty_like(v_layer[..., :0, :])
-                # 移除 .squeeze(0) 以保持正确的二维形状 [1, 0]
                 new_fusion_counts[layer_idx] = fc_layer[..., :0]
                 continue
 
@@ -684,26 +652,24 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
         new_cache = DynamicCache()
 
-        # 2. 遍历我们筛选出的 keys 和 values
+        # 2. Iterate through our filtered keys and values
         for i in range(num_layers):
-            # 只有当该层有需要保留的token时才进行更新
             if new_keys[i] is not None and new_keys[i].shape[2] > 0:
-                # 3. 使用官方的 update() 方法来安全地填充新cache
-                #    这个方法会正确处理每一层的内部状态，包括其独立的序列长度
                 new_cache.update(new_keys[i], new_values[i], layer_idx=i)
 
-        # 4. 用这个状态完全正确的新cache，替换掉模型流式状态中的旧cache
+        # Use official update() method to safely populate new cache
         self.streaming_state["past_key_values"] = new_cache
 
-        # 5. 更新 fusion_counts (这部分是简单的列表，可以直接替换)
+        # Update fusion_counts 
         self.streaming_state["fusion_counts"] = new_fusion_counts
-        # ========================= 修复结束 ==========================
+
 
     @torch.no_grad()
     def _insert_frame_prototypes(self, new_tokens_len: int):
         """
-        在模型前向传播后，为新处理的视觉帧计算并插入帧级原型到KV Cache中。
-        此操作针对每一层独立进行。
+        After model forward propagation, compute and insert frame-level prototypes 
+        into KV Cache for newly processed visual frames.
+        This operation is performed independently for each layer.
         """
         pkv = self.streaming_state.get("past_key_values")
         if pkv is None or new_tokens_len == 0:
@@ -711,13 +677,14 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
         num_layers = len(self.language_model.layers)
 
-        # 1. 获取刚刚添加的 new_tokens 在 cache 中的起始位置
-        # 注意：这里假设各层长度在操作前是一致的，对于我们的流式模型是成立的
+        # 1. Get the starting position of newly added new_tokens in cache
+        # Note: Here we assume layer lengths are consistent before operation, 
+        # which holds true for our streaming model
         past_kv_len = pkv.get_seq_length(layer_idx=0) - new_tokens_len
 
-        # 2. 计算新Token的重要性分数 (与 _compress_kv_cache 逻辑类似)
-        # 我们需要一种方法来仅对新Token进行评分。
-        # 这里我们复用完整的评分机制，然后切片出我们关心的部分。
+        # 2. Compute importance scores for new tokens (similar to _compress_kv_cache logic)
+        # We need a method to score only the new tokens.
+        # Here we reuse the full scoring mechanism, then slice out the portion we care about.
         proxy_queries = self._proxy_prefill_and_get_queries(pkv)
 
         new_keys_per_layer = []
@@ -726,55 +693,52 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
         for layer_idx in range(num_layers):
             k_layer, v_layer = pkv[layer_idx]
-
-            # 提取刚刚由新帧生成的 K, V
             new_k = k_layer[:, :, past_kv_len:, :]
             new_v = v_layer[:, :, past_kv_len:, :]
 
-            if new_k.shape[2] == 0:  # 如果没有新的token，则跳过
+            if new_k.shape[2] == 0:  
                 new_keys_per_layer.append(k_layer)
                 new_values_per_layer.append(v_layer)
                 new_fusion_counts_per_layer.append(
                     self.streaming_state["fusion_counts"][layer_idx])
                 continue
 
-            # 使用代理查询计算与新 K 的注意力分数
+            # Extract K, V just generated by the new frame
             q_proxy = proxy_queries[layer_idx]
             num_kv_groups = self.language_model.layers[layer_idx].self_attn.num_key_value_groups
             k_layer_repeated = repeat_kv(new_k, num_kv_groups)
             attn_scores = torch.matmul(
                 q_proxy, k_layer_repeated.transpose(-2, -1))
 
-            # 将分数聚合为每个token的重要性
+            # Compute attention scores with new K using proxy queries
             importance_scores = attn_scores.mean(dim=2).mean(dim=1).squeeze(0)
 
-            # 3. 计算帧原型 (Equation 2)
-            # 归一化重要性分数 -> alpha_j
+            # Aggregate scores into importance per token
             normalized_scores = F.softmax(importance_scores.to(
                 torch.float32), dim=0).to(new_k.dtype)
 
-            # 计算加权平均 K_prototype 和 V_prototype
-            # 维度: [1, num_heads, 1, head_dim]
+            # 3. Compute frame prototype (Equation 2)
+            # Normalize importance scores -> alpha_j
             k_prototype = torch.sum(
                 new_k * normalized_scores.view(1, 1, -1, 1), dim=2, keepdim=True)
             v_prototype = torch.sum(
                 new_v * normalized_scores.view(1, 1, -1, 1), dim=2, keepdim=True)
 
-            # 4. 将原型插入到完整的 K, V Cache 末尾
+            # 4. Insert prototype at the end of full K, V Cache
             final_k = torch.cat([k_layer, k_prototype], dim=2)
             final_v = torch.cat([v_layer, v_prototype], dim=2)
 
             new_keys_per_layer.append(final_k)
             new_values_per_layer.append(final_v)
 
-            # 5. 更新 fusion_counts
+            # 5. Update fusion_counts
             prototype_fusion_count = torch.tensor(
                 [[1.0]], device=self.device)  # 原型Token的计数为1
             updated_fc = torch.cat(
                 [self.streaming_state["fusion_counts"][layer_idx], prototype_fusion_count], dim=1)
             new_fusion_counts_per_layer.append(updated_fc)
 
-        # 6. 安全地更新整个KV Cache状态
+        # 6. Safely update entire KV Cache state
         new_cache = DynamicCache()
         for i in range(num_layers):
             if new_keys_per_layer[i] is not None and new_keys_per_layer[i].shape[2] > 0:
@@ -791,7 +755,7 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         max_iterations: int = 10
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        递归执行token合并，通过多次二分图合并最多可以砍掉7/8的tokens。
+        Recursively performs token merging as described in https://arxiv.org/pdf/2210.09461.
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
@@ -843,17 +807,15 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         combined_fusion_counts: Optional[torch.Tensor],
         device: torch.device,
         dtype: torch.dtype,
-        batch_size: int = 1,  # *** 显式添加此参数 ***
+        batch_size: int = 1,  
     ) -> Optional[torch.Tensor]:
         """
-        为流式 Prefill 创建一个正确的注意力掩码 (attn_bias)。
+        Create a correct attention mask (attn_bias) for streaming Prefill.
         """
         if q_len == 0:
             return None
 
         current_total_kv_len = past_key_values_length + q_len
-
-        # 使用 batch_size 参数
         attn_bias = torch.zeros(
             batch_size, 1, q_len, current_total_kv_len, device=device, dtype=dtype)
 
@@ -867,13 +829,10 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
             )
 
         if combined_fusion_counts is not None:
-            # 确保维度匹配 [B, 1, 1, L]
             if combined_fusion_counts.dim() == 1:
-                # 如果输入是 [L]，扩展为 [1, 1, 1, L] 并根据 batch_size 复制
                 fc = combined_fusion_counts.unsqueeze(0).unsqueeze(
                     0).unsqueeze(0).expand(batch_size, -1, -1, -1)
             elif combined_fusion_counts.dim() == 2:
-                # 如果输入是 [B, L]，扩展为 [B, 1, 1, L]
                 fc = combined_fusion_counts.unsqueeze(1).unsqueeze(1)
             else:
                 fc = combined_fusion_counts
@@ -1071,7 +1030,7 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
 
         return special_image_mask, special_video_mask
 
-    # ============================== START: MODIFIED FORWARD METHOD ==============================
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -1270,20 +1229,6 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
             layer_fusion_counts=new_fc_history,
             # No need to pass attention_mask, it's handled internally now
         )
-        # # 2. 如果处理的是视频帧，则计算并插入帧原型到KV Cache中
-        # if pixel_values_videos is not None:
-        #     # `new_chunk_len` 包含了文本和视觉token，我们需要区分
-        #     # 简单起见，我们假设所有新token都参与原型计算，这与论文精神一致
-        #     # （对vt中的所有token计算原型）
-        #     num_visual_tokens = final_processed_features.shape[0] if 'final_processed_features' in locals(
-        #     ) else 0
-
-        #     # 我们只对新加入的视觉部分计算原型
-        #     if num_visual_tokens > 0:
-        #         self._insert_frame_prototypes(new_tokens_len=num_visual_tokens)
-
-        # ==================== 修改结束 ====================
-
         return LlavaOnevisionModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=pkv,
@@ -1296,7 +1241,7 @@ class LlavaOnevisionModel(LlavaOnevisionPreTrainedModel):
         pixel_values: torch.FloatTensor,
         vision_feature_layer: Union[int, list[int]],
         vision_feature_select_strategy: str,
-        **kwargs,  # 添加 **kwargs 以接收并忽略多余的参数
+        **kwargs,  
     ):
         """
         Obtains video last hidden states from the vision tower, apply multimodal projection and pooling.
