@@ -24,25 +24,19 @@ from transformers import AutoTokenizer
 try:
     from InternVL3_5 import InternVLChatModel
 except ImportError:
-    print("导入失败。尝试从 transformers 导入...")
     from transformers import AutoModelForCausalLM as InternVLChatModel
 
-# --- 日志记录器设置 ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 fmt_str = "%(asctime)s %(levelname)5s | %(message)s"
 fmt = logging.Formatter(fmt_str)
 
-# --- 提示模板 (MLVU Format) ---
 prompt_template = """Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, D, etc.) of the correct option.
 Question: {}
 Options:
 {}
 The best answer is:"""
 
-# ==============================================================================
-# InternVL 视频预处理函数 (完全继承你的代码)
-# ==============================================================================
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -147,12 +141,9 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
         logger.error(f"Error loading video {video_path}: {e}")
         return None, None
 
-# ==============================================================================
-# 辅助函数
-# ==============================================================================
 
 
-def extract_characters_regex(s):
+def extract_characters_regex():
     s = s.strip()
     answer_prefixes = [
         "The best answer is", "The correct answer is", "The answer is", "The answer",
@@ -162,7 +153,6 @@ def extract_characters_regex(s):
         if s.lower().startswith(prefix.lower()):
             s = s[len(prefix):].strip()
 
-    # MLVU 选项可能到 E
     if len(s.split()) > 10 and not re.search(r"\b[A-E]\b", s, re.IGNORECASE):
         return ""
     matches = re.search(r"^\(?([A-E])\)?\.?\b", s, re.IGNORECASE)
@@ -185,18 +175,18 @@ def merge_jsonl_files(base_path, world_size):
                         merged_data.append(json.loads(line))
                     except json.JSONDecodeError:
                         logger.warning(
-                            f"无法解析文件 {file_path} 中的行: {line.strip()}")
+                            f"Failed to parse line in file {file_path}: {line.strip()}")
     merged_file_path = f"{base_path}_merged.jsonl"
     with open(merged_file_path, 'w', encoding='utf-8') as f:
         for item in merged_data:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
-    logger.info(f"成功合并 {len(merged_data)} 条记录到 {merged_file_path}")
+    logger.info(f"Successfully merged {len(merged_data)} records to {merged_file_path}")
     return merged_file_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="在 MLVU 数据集上进行 InternVL 分布式评测。")
+        description="Distributed evaluation of InternVL on the MLVU dataset.")
     parser.add_argument("--run_name", type=str, required=True)
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--result_dir", type=str, required=True)
@@ -205,7 +195,6 @@ def main():
     parser.add_argument("--num_frames", type=int, default=100)
     args = parser.parse_args()
 
-    # --- 1. 分布式环境初始化 ---
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend='nccl')
@@ -213,7 +202,7 @@ def main():
     is_main_process = local_rank == 0
     torch.manual_seed(1919810)
 
-    # --- 2. 路径和日志设置 ---
+
     curr_time = datetime.now().strftime("%Y%m%d")
     if is_main_process:
         os.makedirs(args.result_dir, exist_ok=True)
@@ -234,11 +223,8 @@ def main():
         stream_handler.setFormatter(fmt)
         logger.addHandler(stream_handler)
 
-    logger.info(f"---[Rank {local_rank}/{world_size}] 进程启动 ---")
-
-    # --- 3. 模型和 Tokenizer 加载 ---
-    logger.info(f"[Rank {local_rank}] 正在加载 InternVL 模型...")
-    # 注意：在分布式环境中，务必使用 device_map={"": local_rank} 替代 auto
+    logger.info(f"---[Rank {local_rank}/{world_size}] Process started ---")
+    logger.info(f"[Rank {local_rank}] Loading InternVL model...")
     model = InternVLChatModel.from_pretrained(
         args.ckpt_path,
         torch_dtype=torch.bfloat16,
@@ -251,10 +237,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.ckpt_path, trust_remote_code=True, use_fast=False)
     generation_config = dict(max_new_tokens=128, do_sample=False)
-    logger.info(f"[Rank {local_rank}] 模型加载完成。")
+    logger.info(f"[Rank {local_rank}] Model loading complete.")
 
-    # --- 4. 数据加载与分布式切分 ---
-    logger.info(f"[Rank {local_rank}] 正在加载 MLVU 数据...")
+    logger.info(f"[Rank {local_rank}] Loading MLVU data...")
     with open(args.task_json, 'r', encoding='utf-8') as f:
         full_data = json.load(f)
 
@@ -277,7 +262,6 @@ def main():
     rank_indices = indices[local_rank::world_size]
     task_data = [all_questions[i] for i in rank_indices]
 
-    # 断点续传逻辑
     processed_ids = set()
     if osp.exists(output_jsonl_path):
         with open(output_jsonl_path, 'r', encoding='utf-8') as f:
@@ -290,9 +274,8 @@ def main():
         task_data = [
             item for item in task_data if item['question_id'] not in processed_ids]
         logger.info(
-            f"[Rank {local_rank}] 恢复进度，跳过已完成的任务。剩余任务: {len(task_data)}")
+            f"[Rank {local_rank}] Resuming progress, skipping completed tasks. Remaining tasks: {len(task_data)}")
 
-    # --- 5. 推理循环 ---
     start_time = time.time()
     cnt_total = defaultdict(int)
     cnt_correct = defaultdict(int)
@@ -303,10 +286,10 @@ def main():
         try:
             video_path = osp.join(args.video_dir, item['video_path'])
             if not osp.exists(video_path):
-                logger.warning(f"视频文件未找到: {video_path}")
+                logger.warning(f"Video file not found: {video_path}")
                 continue
 
-            # 加载视频并设置帧数
+            # Load video and set frame count
             pixel_values, num_patches_list = load_video(
                 video_path, num_segments=args.num_frames, max_num=1)
             if pixel_values is None:
@@ -314,7 +297,7 @@ def main():
 
             pixel_values = pixel_values.to(torch.bfloat16).cuda(local_rank)
 
-            # 组装 Prompt
+            # Assemble Prompt
             options_str = "\n".join(
                 [f"{chr(65+i)}) {choice}" for i, choice in enumerate(item['choices'])])
             question_text = prompt_template.format(
@@ -323,7 +306,7 @@ def main():
                 [f'Frame{i+1}: <image>\n' for i in range(len(num_patches_list))])
             full_question = video_prefix + question_text
 
-            # 模型推理
+            # Model inference
             response, _ = model.chat(
                 tokenizer,
                 pixel_values,
@@ -334,16 +317,16 @@ def main():
                 return_history=True
             )
 
-            # 清理 response
+            # Clean up response
             if 'assistant\n' in response:
                 response = response.split('assistant\n')[-1].strip()
 
-            # 校验答案
+            # Validate answer
             try:
                 answer_idx = item['choices'].index(item['answer'])
                 correct_letter = chr(65 + answer_idx)
             except ValueError:
-                logger.warning(f"答案 '{item['answer']}' 不在选项列表中，跳过。")
+                logger.warning(f"Answer '{item['answer']}' not in options list, skipping.")
                 continue
 
             pred_letter = extract_characters_regex(response)
@@ -356,7 +339,6 @@ def main():
             cnt_total['overall'] += 1
             cnt_total[question_type] += 1
 
-            # 记录结果
             output_dict = {
                 'question_id': item['question_id'],
                 'video_id': item['video_id'],
@@ -374,13 +356,11 @@ def main():
 
         except Exception as e:
             logger.error(
-                f"[Rank {local_rank}] 处理报错 {item.get('question_id')}: {e}")
+                f"[Rank {local_rank}] Error processing {item.get('question_id')}: {e}")
 
-    # --- 6. 结果汇总与指标统计 ---
     dist.barrier()
-    logger.info(f"[Rank {local_rank}] 推理完成，等待汇总...")
+    logger.info(f"[Rank {local_rank}] Inference complete, waiting for aggregation...")
 
-    # 动态获取所有问题类型，确保各 GPU 对齐
     all_question_types = sorted(
         list(set(q['question_type'] for q in all_questions)))
     stats_list = [cnt_total['overall'], cnt_correct['overall']]
@@ -392,7 +372,7 @@ def main():
     dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
 
     if is_main_process:
-        logger.info("--- 所有进程已完成，开始最终结果汇总 ---")
+        logger.info("--- All processes completed, starting final results aggregation ---")
         base_output_path = osp.join(
             args.result_dir, 'output', f"{args.run_name}_{curr_time}")
         merge_jsonl_files(base_output_path, world_size)
@@ -403,9 +383,9 @@ def main():
         if total_processed > 0:
             accuracy = 100 * total_correct / total_processed
             logger.info(
-                f"【总结果】: 总数={total_processed}, 正确={total_correct}, 准确率={accuracy:.2f}%")
+                f"[Overall Results]: Total={total_processed}, Correct={total_correct}, Accuracy={accuracy:.2f}%")
 
-            logger.info("--- 按问题类型分类准确率 ---")
+            logger.info("--- Accuracy by Question Type ---")
             for i, q_type in enumerate(all_question_types):
                 total_cat = stats_tensor[2 + i*2].item()
                 correct_cat = stats_tensor[3 + i*2].item()
@@ -416,7 +396,7 @@ def main():
 
         cost_time = int(time.time() - start_time)
         logger.info(
-            f"总推理耗时: {cost_time // 3600}h {(cost_time % 3600) // 60}m {cost_time % 60}s")
+            f"Total inference time: {cost_time // 3600}h {(cost_time % 3600) // 60}m {cost_time % 60}s")
 
     dist.destroy_process_group()
 
