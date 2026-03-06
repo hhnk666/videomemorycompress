@@ -60,7 +60,6 @@ from transformers.image_utils import (
 import pdb
 import sys
 import os
-# 添加项目根目录到 sys.path
 sys.path.append("/data1/nyh/TimeChat-Online")
 
 if is_flash_attn_2_available():
@@ -244,11 +243,8 @@ def apply_rotary_pos_emb_vision(
     """
     Applies rotary positional embedding to query and key tensors with memory optimization.
     """
-    # 确保 cos 和 sin 的数据类型与 q, k 一致，以避免不必要的类型转换
     cos = cos.to(q.dtype).unsqueeze(-2)
     sin = sin.to(q.dtype).unsqueeze(-2)
-
-    # 使用原地操作来减少内存分配
     # q_embed = (q * cos) + (rotate_half(q) * sin)
     q_rotated = rotate_half(q)
     q_rotated.mul_(sin)
@@ -258,8 +254,6 @@ def apply_rotary_pos_emb_vision(
     k_rotated = rotate_half(k)
     k_rotated.mul_(sin)
     k.mul_(cos).add_(k_rotated)
-
-    # 由于是原地操作，q 和 k 已经被修改为 q_embed 和 k_embed
     return q, k
 
 
@@ -350,11 +344,6 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
         else:
             cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-        # 1. 像原来一样，构建描述块状注意力的布尔掩码
-        # 注意：在SDPA中，True表示“保留该位置”，False表示“屏蔽该位置”。
-        # 所以我们需要反转逻辑，或者使用加性掩码。
-        # 这里使用加性掩码（0.0 和 -inf）是更通用的做法。
         attention_mask = torch.full(
             (1, 1, seq_length, seq_length),
             -torch.inf,
@@ -366,26 +355,12 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
             end_idx = cu_seqlens[i]
             attention_mask[..., start_idx:end_idx, start_idx:end_idx] = 0.0
 
-        # 2. 准备输入给 F.scaled_dot_product_attention
-        # 输入形状需要是 (batch, num_heads, seq_len, head_dim)
-        # 我们的数据是 un-padded 的，所以 batch=1，seq_len=total_seq_length
-        # (1, num_heads, seq_length, head_dim)
         q = q.unsqueeze(0).transpose(1, 2)
         k = k.unsqueeze(0).transpose(1, 2)
         v = v.unsqueeze(0).transpose(1, 2)
-
-        # ==================== 核心解决方案 ====================
-
-        # 3. 使用 sdp_kernel 上下文管理器强制开启内存高效的后端
-        # enable_mem_efficient=True 对各种 mask 的支持最好
-
         attn_output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attention_mask, dropout_p=0.0
         )
-
-        # =======================================================
-
-        # 恢复形状
         attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
 
@@ -612,12 +587,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        # ==================== 核心BUG修复 ====================
-        # 在复杂的索引和重塑操作之后，张量的内存布局很可能是不连续的。
-        # 强制其内存连续，以防止下游的 flash-attention CUDA 核心
-        # 出现 "invalid argument" 错误。
         rotary_pos_emb = rotary_pos_emb.contiguous()
-        # =======================================================
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
@@ -889,19 +859,13 @@ class Qwen2_5_VLAttention(nn.Module):
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # 融合统计的注意力修正机制
-        # 从config获取融合统计信息
         fusion_count = getattr(self.config, 'current_fusion_count', None)
         if fusion_count is not None and fusion_count.numel() > 0:
-            # 确保fusion_count的形状与注意力权重兼容
-            if fusion_count.shape[1] == attn_weights.shape[-1]:  # 序列长度匹配
-                # 计算注意力修正项: ln(1 + fusion_count)
+            if fusion_count.shape[1] == attn_weights.shape[-1]:  
                 attention_correction = torch.log(fusion_count-1).unsqueeze(
                     1).unsqueeze(1)*0  # (B, 1, 1, L)
-                # 将修正项广播到所有注意力头
                 attention_correction = attention_correction.expand(
                     -1, self.num_heads, attn_weights.shape[2], -1)
-                # 应用注意力修正
                 attn_weights = attn_weights + attention_correction
 
         # Fix precision issues in Qwen2-VL float16 inference
@@ -1056,12 +1020,11 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
 
 class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
     """
-    最终修正版本：使用 SDPA 并解决了 dtype 匹配问题，同时确保注意力修正在解码过程中持续有效。
+    Uses SDPA and resolves dtype matching issues, while ensuring attention corrections remain effective throughout the decoding process.
     """
 
     def __init__(self, config: Qwen2_5_VLConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
-    # 在 Qwen2_5_VLSdpaAttention 类中
 
     def forward(
         self,
@@ -1080,16 +1043,17 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         if output_attentions:
             raise ValueError(
                 "SDPA-based attention does not support `output_attentions=True`.")
-        # ==================== 新增保护代码 ====================
-        # 添加一个断言来捕获 q_len=0 的问题，这能帮助我们确认问题来源
+        # ==================== Added Protection Code ====================
+        # Add an assertion to catch q_len=0 issues, helping us identify the source of the problem
         if hidden_states.shape[1] == 0:
-            # 在正常情况下，我们不应该到达这里。如果到达，说明上游逻辑有问题。
-            # 暂时返回一个空输出以避免崩溃，但这标志着一个需要解决的问题。
+            # Under normal circumstances, we should not reach here. 
+            # If we do, it indicates an issue in upstream logic.
+            # Temporarily return an empty output to avoid crashing, 
+            # but this marks a problem that needs to be addressed.
             if use_cache:
                 return hidden_states, None, past_key_value
             else:
                 return hidden_states, None, None
-        # ======================================================
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -1117,47 +1081,27 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        # ==================== 核心修改：新的融合修正逻辑 ====================
         attn_bias = attention_mask
 
-        # 如果 fusion_counts 存在，则应用注意力修正
         if fusion_counts is not None and fusion_counts.numel() > 0:
-            # 如果原始掩码不存在（常见于解码阶段），我们需要创建一个零偏置
             if attn_bias is None:
                 kv_len = key_states.shape[2]
                 attn_bias = torch.zeros(
                     bsz, 1, q_len, kv_len,
                     device=query_states.device, dtype=query_states.dtype
                 )
-
-            # 确保 fusion_counts 是 1D 张量
             if fusion_counts.dim() > 1:
                 fusion_counts = fusion_counts.squeeze()
 
-            # 计算修正项: log(count)。使用 log1p(count - 1) 更稳定
-            # count=1 (未融合) -> log(1)=0，修正为0，正确
-            # correction_len = min(attn_bias.shape[-1], fusion_counts.shape[-1])
-            # if correction_len > 0:
-            #     attention_correction = torch.log1p(
-            #         fusion_counts[:correction_len] - 1
-            #     ).to(query_states.dtype)
-
-            #     # 调整形状以便广播 [1, 1, 1, L] or [B, 1, 1, L]
-            #     attention_correction = attention_correction.view(
-            #         -1, 1, 1, correction_len)
-
-            #     # 将修正加到注意力偏置上
-            #     attn_bias[..., :correction_len] += attention_correction
-
-        # 确保数据类型匹配
+        # Ensure dtype matching
         if attn_bias is not None:
             attn_bias = attn_bias.to(query_states.dtype)
 
-        # 对于 Prefill 阶段 (q_len > 1)，如果外部没有提供任何掩码，
-        # 我们仍然需要一个标准的因果掩码。但在我们的流式场景中，外部总会提供一个掩码。
+        # For Prefill phase (q_len > 1), if no external mask is provided,
+        # we still need a standard causal mask. However, in our streaming scenario, 
+        # an external mask is always provided.
 
         is_causal_flag = (q_len > 1) and (attn_bias is None)
-        # ==========================================================
 
         attn_output = F.scaled_dot_product_attention(
             query=query_states,
@@ -1172,8 +1116,6 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
         print(key_states.shape)
-
-        # past_key_value 是在上面 .update() 时被修改的，所以直接返回即可
         return attn_output, None, past_key_value
 
 
@@ -1302,12 +1244,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
-        # --- 新增代码：用于流式模拟的状态管理 ---
         self.streaming_state = {
             "past_key_values": None,
             "logic_pos": 0,
             "fusion_counts": [],
-            "last_frame_hidden_states": None,  # 用于帧间比较
+            "last_frame_hidden_states": None,  
         }
         self.kv_cache_token_limit_per_layer = 6000
         self.post_init()
@@ -1324,22 +1265,29 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         in_frame_threshold: float
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        单次二分图合并，用合并后的向量替换目标位置，并返回被合并掉的token的索引。
-        此函数精确控制梯度：决策过程无梯度，合并过程有梯度。
+        Single bipartite graph merge with gradient control.
+        
+        Args:
+            frame_hs: Input frame hidden states of shape (num_tokens, hidden_dim)
+            in_frame_threshold: Similarity threshold for merging decision (higher = more conservative)
+        
+        Returns:
+            updated_frame_hs: Tensor with merged vectors at target positions, shape (new_num_tokens, hidden_dim)
+            dropped_indices_relative: Relative indices (w.r.t. original even positions) of merged-out tokens
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
 
-        # --- 决策路径 (无梯度) ---
-        # 创建一个分离的张量用于所有决策逻辑（相似度计算、索引选择）
+        # --- Decision Path (No Gradient) ---
+        # Create a detached tensor for all decision logic (similarity computation, index selection)
         frame_hs_detached = frame_hs.detach()
 
-        # L2归一化以计算余弦相似度
+        # L2 normalization for cosine similarity computation
         metric_norm = frame_hs_detached / \
             frame_hs_detached.norm(dim=-1, keepdim=True)
-        metric_norm = metric_norm.unsqueeze(0)  # 增加batch维度
+        metric_norm = metric_norm.unsqueeze(0)  
 
-        # 分割为 a 组 (偶数) 和 b 组 (奇数)
+        # Split into group a (even indices) and group b (odd indices)
         a, b = metric_norm[:, ::2, :], metric_norm[:, 1::2, :]
 
         if a.shape[1] == 0 or b.shape[1] == 0:
@@ -1349,7 +1297,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         node_max, node_idx = scores.max(dim=-1)
         edge_idx = (node_max > in_frame_threshold).squeeze(0)  # Shape: [num_a]
 
-        # 如果没有token需要合并，直接返回原始张量
+        # If no tokens need to be merged, return the original tensor directly
         if not edge_idx.any():
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
 
@@ -1357,9 +1305,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         a_dropped_indices_relative = a_indices_relative[edge_idx]
         dropped_indices_relative = a_dropped_indices_relative * 2
 
-        # --- 合并路径 (有梯度) ---
-        # 使用原始的、带梯度的 frame_hs 进行向量计算
-        updated_frame_hs = frame_hs.clone()  # 克隆以进行修改，保持梯度连接
+        # --- Merging Path (With Gradient) ---
+        # Use the original frame_hs with gradients for vector computation
+        updated_frame_hs = frame_hs.clone()  # Clone for modification while preserving gradient connection
         a_orig, b_orig = frame_hs[::2, :], frame_hs[1::2, :]
 
         merged_sum = torch.zeros_like(b_orig, dtype=frame_hs.dtype)
@@ -1368,36 +1316,35 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         b_dest_map = node_idx.squeeze(0)[edge_idx]
 
-        # 使用index_add_聚合，源向量 a_orig[edge_idx] 带有梯度
+        # Aggregate using index_add_; source vectors a_orig[edge_idx] have gradients
         merged_sum.index_add_(0, b_dest_map, a_orig[edge_idx])
         counts.index_add_(0, b_dest_map, torch.ones_like(
             b_dest_map, dtype=torch.int64))
 
         b_consumed_indices_relative = torch.unique(b_dest_map)
 
-        # 目标向量 b_orig[...] 也带有梯度
+        # Target vectors b_orig[...] also have gradients
         merged_sum.index_add_(0, b_consumed_indices_relative,
                               b_orig[b_consumed_indices_relative])
         counts.index_add_(0, b_consumed_indices_relative, torch.ones_like(
             b_consumed_indices_relative, dtype=torch.int64))
 
-        # 计算平均值，这个操作是可微的
+        # Compute average; this operation is differentiable
         final_merged_vectors = merged_sum[b_consumed_indices_relative] / \
             counts[b_consumed_indices_relative].unsqueeze(
                 -1).to(frame_hs.dtype)
 
-        # --- 更新 ---
-        # 将新计算的、带梯度的向量替换回 updated_frame_hs
+        # Replace with newly computed vectors that preserve gradients
         original_b_consumed_indices = b_consumed_indices_relative * 2 + 1
         updated_frame_hs[original_b_consumed_indices] = final_merged_vectors
 
         return updated_frame_hs, dropped_indices_relative
 
-    # --- 关键新增函数 ---
 
     def reset_streaming_state(self):
         """
-        显式重置模型的流式处理状态，用于在处理新的独立样本前调用。
+        Explicitly reset the model's streaming state. 
+        Call this before processing a new independent sample.
         """
         print("--- Resetting model streaming state for new sample ---")
         self.streaming_state = {
@@ -1406,7 +1353,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             "logic_pos": 0,
             "last_frame_hidden_states": None,
         }
-    # --- 新增结束 ---
 
     def _bipartite_merge_and_replace(
         self,
@@ -1415,16 +1361,14 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         max_iterations: int = 10
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        递归执行token合并，通过多次二分图合并最多可以砍掉7/8的tokens。
-
+        Recursively performs token merging. 
         Args:
-            frame_hs: 输入的frame hidden states
-            in_frame_threshold: 合并阈值
-            max_iterations: 最大递归次数，默认3次可砍掉7/8的tokens
-
+            frame_hs: Input frame hidden states
+            in_frame_threshold: Merging threshold
+            max_iterations: Maximum number of recursive iterations.
         Returns:
-            updated_frame_hs: 更新后的hidden states
-            all_dropped_indices: 所有被丢弃的token索引（相对于原始序列）
+            updated_frame_hs: Updated hidden states
+            all_dropped_indices: Indices of all dropped tokens (relative to original sequence)
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
@@ -1432,126 +1376,109 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         current_frame_hs = frame_hs
         all_dropped_indices = []
 
-        # 用于追踪原始索引到当前索引的映射
+        # Track mapping from original indices to current indices
         original_to_current_mapping = torch.arange(
             frame_hs.shape[0], device=frame_hs.device)
 
         for iteration in range(max_iterations):
-            # 如果剩余token数量太少，停止递归
+            # Stop recursion if remaining tokens are too few
             if current_frame_hs.shape[0] < 2:
                 break
 
-            # 执行单次二分图合并
+            # Perform single bipartite merge
             updated_frame_hs, dropped_indices_current = self._bipartite_merge_and_replace_single(
                 current_frame_hs, in_frame_threshold
             )
 
-            # 如果没有token被丢弃，停止递归
+            # Stop recursion if no tokens were dropped
             if dropped_indices_current.numel() == 0:
                 break
 
-            # 将当前坐标系下的dropped indices映射回原始坐标系
+            # Map dropped indices from current coordinate system back to original
             dropped_indices_original = original_to_current_mapping[dropped_indices_current]
             all_dropped_indices.append(dropped_indices_original)
 
-            # 更新映射关系：移除被丢弃的token对应的映射
+            # Update mapping: remove mappings corresponding to dropped tokens
             keep_mask = torch.ones(
                 current_frame_hs.shape[0], dtype=torch.bool, device=frame_hs.device)
             keep_mask[dropped_indices_current] = False
             original_to_current_mapping = original_to_current_mapping[keep_mask]
 
-            # 更新当前的frame_hs为合并后的结果
+            # Update current frame_hs to the merged result
             current_frame_hs = updated_frame_hs[keep_mask]
 
-            # 可选：添加调试信息
-            if 1:  # 只在第一次迭代时打印，避免过多日志
+            if 1:  
                 reduction_ratio = dropped_indices_current.numel(
                 ) / (current_frame_hs.shape[0] + dropped_indices_current.numel())
-                print(f"Token合并迭代 {iteration + 1}: 删除 {dropped_indices_current.numel()} tokens, "
-                      f"剩余 {current_frame_hs.shape[0]} tokens, 删除率: {reduction_ratio:.2%}")
 
-        # 合并所有被丢弃的索引
         if all_dropped_indices:
             final_dropped_indices = torch.cat(all_dropped_indices, dim=0)
         else:
             final_dropped_indices = torch.tensor(
                 [], dtype=torch.long, device=frame_hs.device)
 
-        # 构造最终的更新后的frame_hs
-        # 我们需要保持原始tensor的结构，将保留的token放在正确的位置
         final_frame_hs = frame_hs.clone()
 
-        # 创建最终的keep mask
         final_keep_mask = torch.ones(
             frame_hs.shape[0], dtype=torch.bool, device=frame_hs.device)
         if final_dropped_indices.numel() > 0:
             final_keep_mask[final_dropped_indices] = False
 
-        # 将合并后的结果放回对应位置
         final_frame_hs[original_to_current_mapping] = current_frame_hs
 
         return final_frame_hs, final_dropped_indices
 
-    # 在 Qwen2_5_VLModel 类中，可以放在 _update_causal_mask 附近
-
     def _create_streaming_attention_mask(
         self,
         q_len: int,
-        # 修改：直接接收计算好的历史长度
         past_key_values_length: int,
         combined_fusion_counts: Optional[torch.Tensor],
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
         """
-        为流式 Prefill 创建一个正确的注意力掩码 (attn_bias)。
-        - Query (当前块的 token) 可以关注所有历史 Key (过去缓存中的 token)。
-        - Query 内部遵循因果关系。
-        - 根据 combined_fusion_counts 对注意力分数进行修正。
+        Creates a correct attention mask (attn_bias) for streaming Prefill.
+        - Query (tokens in current block) can attend to all historical Keys (tokens in past cache).
+        - Causality is enforced within Query.
+        - Attention scores are corrected based on combined_fusion_counts.
         """
         if q_len == 0:
             return None
-
-        # 使用传入的长度
         past_cache_len = past_key_values_length
         current_total_kv_len = past_cache_len + q_len
 
-        # 初始化一个基础掩码 (bsz=1, heads=1, q_len, current_total_kv_len)
+        # Initialize a base mask (bsz=1, heads=1, q_len, current_total_kv_len)
         attn_bias = torch.zeros(
             1, 1, q_len, current_total_kv_len, device=device, dtype=dtype)
 
-        # 1. 对当前块内部应用因果掩码
+        # Apply causal mask within the current block
         if q_len > 1:
             causal_mask_bool = torch.triu(
                 torch.ones(q_len, q_len, dtype=torch.bool, device=device),
                 diagonal=1
             )
-            # 将因果掩码应用到 attn_bias 的 Query-Query 部分
             attn_bias[..., :, past_cache_len:].masked_fill_(
                 causal_mask_bool, -torch.inf
             )
 
-        # 2. 应用 fusion_count 修正
+        # 2. Apply fusion_count correction
         if combined_fusion_counts is not None and combined_fusion_counts.numel() > 0:
             if combined_fusion_counts.shape[-1] != current_total_kv_len:
-                # 在调试时，可以打开这个检查
-                # raise ValueError(f"Fusion counts length ({combined_fusion_counts.shape[-1]}) does not match "
-                #                  f"total KV cache length ({current_total_kv_len}).")
                 pass
 
             correction_len = min(current_total_kv_len,
                                  combined_fusion_counts.shape[-1])
             if correction_len > 0:
-                # 确保 combined_fusion_counts 在正确的设备上
+                # Ensure combined_fusion_counts is on the correct device
                 combined_fusion_counts = combined_fusion_counts.to(
                     device=device, dtype=dtype)
 
-                # 注意力修正项的形状为 (1, 1, 1, correction_len)
+                # Shape of attention correction term is (1, 1, 1, correction_len)
                 attention_correction = torch.log1p(
                     combined_fusion_counts[..., :correction_len]-1
                 ).unsqueeze(0).unsqueeze(0).unsqueeze(0)
 
-                # 将修正项广播并加到 attn_bias 上
+                # Broadcast and add correction term to attn_bias
                 attn_bias[..., :correction_len] += attention_correction
 
         return attn_bias
@@ -1573,9 +1500,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         dp_save_path: Optional[str] = None,
         token_selection_baseline: Optional[str] = None,
     ):
-        ### MODIFIED START ###
-        original_hidden_states = hidden_states.clone()  # Save original hidden_states
-        ### MODIFIED END ###
+        original_hidden_states = hidden_states.clone()  
         if absolute is None:
             absolute = True
         arg_check = ""
@@ -1827,7 +1752,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         # --- Batch Post-processing ---
 
         # Check if all sequences in the batch have the same length after dropping
-        if batch_size > 0 and all(s.shape[0] == final_hidden_states[0].shape[0] for s in final_hidden_states):
+        if batch_size > 0 and all(s.shape[0] == final_hidden_states[0].shape[0] forin final_hidden_states):
             dropped_hidden_states = torch.stack(final_hidden_states, dim=0)
             dropped_pos_emb1 = torch.cat(final_pos_emb1, dim=1)
             dropped_pos_emb2 = torch.cat(final_pos_emb2, dim=1)
@@ -1869,30 +1794,33 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     @torch.no_grad()
     def _find_merge_indices_by_budget(self, k_vectors: torch.Tensor, fusion_counts: torch.Tensor, num_to_drop: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        [修正版 - 超高性能近似] 根据预算查找要合并的 token 对的索引。
-
-        该方法将问题极大简化，仅考虑将偶数索引的 token 与其相邻的奇数索引 token 进行合并。
-        这形成了一个无冲突的二分匹配问题，可以被看作是一种高效的近似解。
-
-        算法流程：
-        1. 形成候选对：(0,1), (2,3), (4,5), ...
-        2. 一次性计算所有这些候选对的综合分数，该分数同时考虑了向量的余弦相似度和范数相似度。
-        - 综合相似度 = 余弦相似度 * 范数相似度
-        - 最终分数 = 综合相似度 / fusion_count_sum
-        3. 对这些分数进行排序，选出分数最高的 `num_to_drop` 个对。
-
-        优点：
-        - 极高的性能，复杂度为 O(N)。
-        - 实现简单，无须处理合并冲突。
-        - 考量了向量方向和长度的相似性，度量更全面，符合Attention机制的原理。
-
+        [Corrected Version - Ultra-High Performance Approximation] Find indices of token pairs to merge based on budget.
+    
+        This method greatly simplifies the problem by only considering merging even-indexed tokens with their 
+        adjacent odd-indexed tokens. This forms a conflict-free bipartite matching problem, which can be viewed 
+        as an efficient approximate solution.
+    
+        Algorithm flow:
+        1. Form candidate pairs: (0,1), (2,3), (4,5), ...
+        2. Compute a comprehensive score for all candidate pairs in one batch, considering both cosine similarity 
+           and norm similarity of vectors.
+           - Comprehensive similarity = cosine_similarity * norm_similarity
+           - Final score = comprehensive_similarity / fusion_count_sum
+        3. Sort these scores and select the top `num_to_drop` pairs with highest scores.
+    
+        Advantages:
+        - Extremely high performance with O(N) complexity.
+        - Simple implementation without handling merge conflicts.
+        - Considers both vector direction and magnitude similarity, providing a more comprehensive metric 
+          that aligns with Attention mechanism principles.
+    
         Args:
-            k_vectors (torch.Tensor): “可压缩区域”的 Key 向量，形状为 [num_tokens, hidden_dim]。
-            fusion_counts (torch.Tensor): “可压缩区域” 对应的 fusion_counts，形状为 [num_tokens]。
-            num_to_drop (int): 需要合并（丢弃）的 token 数量。
-
+            k_vectors (torch.Tensor): Key vectors in the "compressible region", shape [num_tokens, hidden_dim].
+            fusion_counts (torch.Tensor): Corresponding fusion_counts for the "compressible region", shape [num_tokens].
+            num_to_drop (int): Number of tokens to merge (drop).
+    
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: 一个包含合并目标 (target) 和合并源 (source) 索引的元组。
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing indices of merge targets and merge sources.
         """
         if num_to_drop <= 0 or k_vectors.shape[0] < 2:
             return torch.tensor([], device=k_vectors.device, dtype=torch.long), torch.tensor([], device=k_vectors.device, dtype=torch.long)
@@ -1900,7 +1828,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         device = k_vectors.device
         num_tokens = k_vectors.shape[0]
 
-        # --- 步骤 1: 形成偶数-奇数候选对 ---
+        # Form even-odd candidate pairs
         num_pairs = num_tokens // 2
         if num_pairs == 0:
             return torch.tensor([], device=device, dtype=torch.long), torch.tensor([], device=device, dtype=torch.long)
@@ -1908,44 +1836,43 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         targets_indices = torch.arange(0, num_pairs * 2, 2, device=device)
         sources_indices = torch.arange(1, num_pairs * 2, 2, device=device)
 
-        # --- 步骤 2: 批量计算所有候选对的分数 ---
+        # Batch compute scores for all candidate pairs
         k_targets = k_vectors.index_select(0, targets_indices)
         k_sources = k_vectors.index_select(0, sources_indices)
 
         fc_targets = fusion_counts.index_select(0, targets_indices)
         fc_sources = fusion_counts.index_select(0, sources_indices)
 
-        # --- 修改核心：同时考虑余弦相似度和范数差异 ---
-        # 1. 计算余弦相似度（衡量方向）
+        # Core Modification: Consider both cosine similarity and norm difference
+        # 1. Compute cosine similarity
         k_targets_normalized = F.normalize(k_targets, p=2, dim=-1)
         k_sources_normalized = F.normalize(k_sources, p=2, dim=-1)
         cosine_sims = (k_targets_normalized * k_sources_normalized).sum(dim=-1)
 
-        # 2. 计算各个向量的L2范数（长度）
+        # 2. Compute L2 norms (magnitudes) of each vector
         k_targets_norms = torch.norm(k_targets, p=2, dim=-1)
         k_sources_norms = torch.norm(k_sources, p=2, dim=-1)
 
-        # 3. 计算范数相似度因子。该因子在范数相等时为1，在差异大时趋近于0，
-        #    以此来惩罚长度相差悬殊的向量对。
-        #    公式: 2*|a|*|b| / (|a|^2 + |b|^2 + epsilon)，可以有效衡量两个正数的相似度。
+        # 3. Compute norm similarity factor. This factor equals 1 when norms are equal, 
+        #    and approaches 0 when norms differ significantly,
+        #    thereby penalizing vector pairs with vastly different magnitudes.
+        #    Formula: 2*|a|*|b| / (|a|^2 + |b|^2 + epsilon), effectively measures similarity between two positive numbers.
         norm_similarity_factor = 2 * k_targets_norms * k_sources_norms / \
             (k_targets_norms.pow(2) + k_sources_norms.pow(2) + 1e-8)
 
-        # 4. 结合余弦相似度和范数相似度，得到最终的综合相似度分数
+        # 4. Combine cosine similarity and norm similarity to obtain final comprehensive similarity score
         sims = cosine_sims * norm_similarity_factor
-        # --- 修改结束 ---
-
-        # 计算 fusion_count 之和并得出最终分数
+        # Compute sum of fusion_counts and derive final score
         fc_sum = fc_targets + fc_sources
         pair_scores = sims / torch.clamp(fc_sum, min=1.0)
 
-        # --- 步骤 3: 选择分数最高的 N 个对 ---
+        # --- Step 3: Select top N pairs with highest scores ---
         num_to_merge = min(num_to_drop, num_pairs)
 
-        # 使用 topk 高效找到分数最高的 `num_to_merge` 个对的索引
+        # Use topk to efficiently find indices of the `num_to_merge` pairs with highest scores
         _, top_pair_indices = torch.topk(pair_scores, num_to_merge)
 
-        # 从原始的偶数/奇数索引列表中，选出这些最佳对
+        # Select these best pairs from the original even/odd index lists
         final_targets = targets_indices.index_select(0, top_pair_indices)
         final_sources = sources_indices.index_select(0, top_pair_indices)
 
@@ -1981,7 +1908,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 proxy_queries_per_layer.append(q_rot)
                 current_past_len = past_key_values.get_seq_length(layer_idx)
                 total_kv_len = current_past_len + q_len
-                # 创建基础掩码（只含因果关系）
                 attention_mask = torch.zeros(
                     (bsz, 1, q_len, total_kv_len), dtype=hidden_states.dtype, device=device
                 )
@@ -1992,23 +1918,16 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     attention_mask[..., :, current_past_len:].masked_fill_(
                         causal_mask_bool, torch.finfo(hidden_states.dtype).min
                     )
-
-                # 【新增】添加 fusion_counts 偏置
                 if layer_idx < len(fusion_counts_history):
                     fc_layer = fusion_counts_history[layer_idx]
                     if fc_layer is not None and fc_layer.numel() > 0:
-                        # 确保 fc_layer 是 [1, L] 的形状
                         if fc_layer.dim() == 1:
                             fc_layer = fc_layer.unsqueeze(0)
-
-                        # 计算偏置
                         attention_bias = torch.log1p(
                             fc_layer - 1).to(attention_mask.dtype)
-                        # 调整形状以进行广播 [1, 1, 1, L]
                         attention_bias = attention_bias.unsqueeze(
                             1).unsqueeze(1)
 
-                        # 将偏置加到掩码的 K/V 部分
                         bias_len = min(current_past_len,
                                        attention_bias.shape[-1])
                         if bias_len > 0:
@@ -2029,16 +1948,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
     def _compress_kv_cache(self):
         """
-        采用"均匀+固定比例+动态熵"三合一混合策略的KV Cache压缩。
-        - 30% 均匀分配，保证鲁棒性
-        - 35% 基于先验知识的固定比例分配
-        - 35% 基于当前上下文的动态熵分配
+        KV Cache compression using a hybrid "uniform + fixed-ratio + dynamic entropy" strategy.
         """
         pkv = self.streaming_state["past_key_values"]
         if pkv is None or pkv.get_seq_length(layer_idx=0) == 0:
             return
 
-        # 1. 初始化和配置 (逻辑不变)
+        # 1. Initialization and configuration
         try:
             kv_dtype = pkv.key_cache[0].dtype if hasattr(
                 pkv, 'key_cache') and pkv.key_cache else torch.bfloat16
@@ -2060,7 +1976,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if current_total_len <= total_budget:
             return
 
-        # 2. 计算重要性得分和熵 (恢复熵的计算)
+        # 2. Compute importance scores and entropy
         pkv_clone = DynamicCache()
         if pkv.get_seq_length() > 0:
             for layer_idx in range(num_layers):
@@ -2071,7 +1987,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         num_kv_groups = self.layers[0].self_attn.num_key_value_groups
 
         layer_scores = []
-        layer_entropies = []  # <--- 恢复熵列表
+        layer_entropies = []  
 
         for layer_idx in range(num_layers):
             k_layer, v_layer = pkv[layer_idx]
@@ -2085,11 +2001,10 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
                 fc_layer = fusion_counts[layer_idx]
                 if fc_layer.numel() == scores.numel():
-                    # ==================== BUG FIX #1 START ====================
-                    # 将 fc_layer 从 [1, N] 压缩至 [N] 以匹配 scores 的维度，防止错误的广播
+                    # Squeeze fc_layer from [1, N] to [N] to match scores dimension, 
+                    # preventing incorrect broadcasting
                     attention_bias = torch.log1p(
                         fc_layer.squeeze(0) - 1).to(scores.device, scores.dtype)
-                    # ==================== BUG FIX #1 END ======================
                     scores = scores+torch.sqrt_(attention_bias+1)
 
                 v_norm = v_layer.norm(p=2, dim=-1).mean(dim=1).squeeze(0)
@@ -2099,34 +2014,31 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
             layer_scores.append(scores)
 
-            # --- 恢复熵的计算逻辑 ---
+            # --- Restore entropy computation logic ---
             if scores.numel() > 0:
                 probs = F.softmax(scores.to(torch.float32), dim=0)
                 entropy = -torch.sum(probs * torch.log(probs + 1e-9))
             else:
                 entropy = torch.tensor(0.0, device=scores.device)
-            # 使用 v_norm 对熵进行加权，使其更关注值较大的token
+            # Weight entropy by v_norm to focus more on tokens with larger values
             layer_entropies.append(torch.log1p_(entropy) * log_v_norm.mean())
 
-        # 3. 动态预算分配 (采用三合一混合策略)
+        # 3. Dynamic budget allocation (using hybrid three-part strategy)
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
         new_fusion_counts = [None] * num_layers
         layer_lens = [pkv.get_seq_length(i) for i in range(num_layers)]
 
         if total_budget > 0:
-            # --- 核心修改部分: 三合一比例混合 ---
-
-            # 定义权重
             weight_uniform = 0.35
             weight_static = 0.625
             weight_entropy = 1 - weight_uniform - weight_static
 
-            # 1. 均匀分配比例
+            # 1. Uniform allocation ratio
             uniform_proportions = torch.full(
                 (num_layers,), 1.0 / num_layers, device=device)
 
-            # 2. 基于先验知识的固定比例
+            # 2. Fixed ratios based on prior knowledge
             if self.size == 3:
                 static_ratios_list = [60, 43, 41, 40, 38, 37, 35, 34, 34, 33, 32, 31, 30, 32, 31,
                                       33, 32, 32, 32, 31, 30, 29, 29, 28, 26, 25, 23, 22, 20, 18, 15, 13, 11, 9, 8, 7]
@@ -2135,38 +2047,36 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                                       3.16, 3.04, 2.98, 2.86, 2.74, 2.58, 2.35, 2.12, 1.74, 1.5, 1.23, 1.03, 0.85, 0.71, 0.39]
             if len(static_ratios_list) != num_layers:
                 raise ValueError(
-                    f"提供的静态比例数量 ({len(static_ratios_list)})与模型层数 ({num_layers})不匹配。")
+                    f"Number of provided static ratios ({len(static_ratios_list)}) does not match number of model layers ({num_layers}).")
             static_ratios_tensor = torch.tensor(
                 static_ratios_list, dtype=torch.float32, device=device)
             static_proportions = static_ratios_tensor / static_ratios_tensor.sum()
 
-            # 3. 基于动态熵的比例
+            # 3. Dynamic entropy-based ratio
             entropies_tensor = torch.stack(layer_entropies)
-            # 归一化熵值，使其不受尺度影响
+            # Normalize entropy values to be scale-invariant
             entropies_tensor = entropies_tensor - entropies_tensor.min()
             total_entropy = entropies_tensor.sum()
 
-            if total_entropy <= 1e-9:  # 边缘情况处理
+            if total_entropy <= 1e-9:  
                 entropy_proportions = uniform_proportions.clone()
             else:
                 entropy_proportions = entropies_tensor / total_entropy
 
-            # 4. 加权混合得到最终比例
+            # 4. Weighted combination to obtain final proportions
             proportions_to_use = (weight_uniform * uniform_proportions +
                                   weight_static * static_proportions +
                                   weight_entropy * entropy_proportions)
-            # --- 修改结束 ---
 
             layer_lens_tensor = torch.tensor(layer_lens, device=device)
             num_to_keep = proportions_to_use * total_budget
 
-            # 修正超额分配 (逻辑不变)
+            # Redistribute excess budget
             over_allocated_mask = num_to_keep > layer_lens_tensor.float()
             excess_budget = (num_to_keep[over_allocated_mask] -
                              layer_lens_tensor[over_allocated_mask].float()).sum()
             num_to_keep = torch.min(num_to_keep, layer_lens_tensor.float())
 
-            # 重新分配多余预算 (逻辑不变)
             if excess_budget > 0:
                 under_allocated_mask = ~over_allocated_mask
                 if under_allocated_mask.any():
@@ -2180,7 +2090,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                             redistribution, (capacity_under - current_under_values).float())
                         num_to_keep[under_allocated_mask] += final_additions
 
-            # 舍入处理 (逻辑不变)
+            # Rounding handling
             floored_keeps = num_to_keep.floor().long()
             remainder = int(total_budget - floored_keeps.sum())
             if remainder > 0:
@@ -2197,9 +2107,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         print(
             f"KV Cache compression budgets per layer: {budgets_for_all_layers}")
-        print(f"校验总和: {sum(budgets_for_all_layers)}")
+        print(f"Checksum: {sum(budgets_for_all_layers)}")
 
-        # --- 4. 对每一层应用精英选择策略 ---
+        # Apply elite selection strategy to each layer
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
         new_fusion_counts = [None] * num_layers
@@ -2219,10 +2129,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             if budget_for_this_layer == 0:
                 new_keys[layer_idx] = torch.empty_like(k_layer[..., :0, :])
                 new_values[layer_idx] = torch.empty_like(v_layer[..., :0, :])
-                # ==================== BUG FIX #2 START ====================
-                # 移除 .squeeze(0) 以保持正确的二维形状 [1, 0]
                 new_fusion_counts[layer_idx] = fc_layer[..., :0]
-                # ==================== BUG FIX #2 END ======================
                 continue
 
             scores_this_layer = layer_scores[layer_idx]
@@ -2233,28 +2140,24 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             new_keys[layer_idx] = k_layer.index_select(2, final_indices)
             new_values[layer_idx] = v_layer.index_select(2, final_indices)
 
-            # ======================== 核心修复 ========================
-            # fc_layer 是一个一维张量，因此必须从维度 0 进行索引选择。
+            # fc_layer is a 1D tensor, so must index along dimension 0.
             new_fusion_counts[layer_idx] = fc_layer.index_select(
                 0, final_indices)
-            # ========================================================
 
-         # ==================== 核心 BUG 修复：安全地更新模型状态 ====================
-        # 1. 创建一个新的、空的 DynamicCache 对象
+        # 1. Create a new, empty DynamicCache object
         new_cache = DynamicCache()
 
-        # 2. 遍历我们筛选出的 keys 和 values
+        # 2. Iterate through our filtered keys and values
         for i in range(num_layers):
-            # 只有当该层有需要保留的token时才进行更新
+            # Only update if this layer has tokens to retain
             if new_keys[i] is not None and new_keys[i].shape[2] > 0:
-                # 3. 使用官方的 update() 方法来安全地填充新cache
-                #    这个方法会正确处理每一层的内部状态，包括其独立的序列长度
+                # 3. Use the official update() method to safely populate the new cache
+                #    This method correctly handles internal state for each layer, 
+                #    including their independent sequence lengths
                 new_cache.update(new_keys[i], new_values[i], layer_idx=i)
 
-        # 4. 用这个状态完全正确的新cache，替换掉模型流式状态中的旧cache
+        # 4. Replace the old cache in the model's streaming state with this correctly-state new cache
         self.streaming_state["past_key_values"] = new_cache
-
-        # 5. 更新 fusion_counts (这部分是简单的列表，可以直接替换)
         self.streaming_state["fusion_counts"] = new_fusion_counts
 
     def image_token_drop(
@@ -2288,21 +2191,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             arg_check += f" Threshold value {threshold} is not within [-1, 1] range for feature thresholding."
         if arg_check:
             raise ValueError(arg_check)
-        # print(in_frame_threshold)
         batch_size, seq_len, hidden_dim = hidden_states.size()
         grid_t, grid_h, grid_w = image_grid_thw[0]
         merge_size = 2
         channel = 3
         temporal_patch_size = 2
         patch_size = 14
-        # =======================> 在这里添加调试代码 <=======================
-        print("\n\n--- 进入 image_token_drop 调试模式 ---")
-        print(f"原始 pixel_values.shape: {pixel_values.shape}")
-        # 这会打印出 12446784
-        print(f"原始 pixel_values 元素总数: {pixel_values.numel()}")
 
-        print(
-            f"从 image_grid_thw 获取的 grid 尺寸: T={grid_t}, H={grid_h}, W={grid_w}")
 
         target_shape_dims = [
             grid_t.item(),
@@ -2319,17 +2214,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         target_elements = 1
         for dim in target_shape_dims:
             target_elements *= dim
-
-        print(f"代码尝试重塑的目标 shape: {target_shape_dims}")
-        print(f"目标 shape 的元素总数: {target_elements}")  # 这会打印出 6025824
-        print(token_selection_baseline)
-        if pixel_values.numel() != target_elements:
-            print("\n!!!!!! 严重错误: 元素总数不匹配 !!!!!!\n")
-            # 引入Python调试器，程序会在这里暂停
-            import pdb
-            pdb.set_trace()
-        # =======================> 调试代码结束 <=======================
-
         pixel_values = pixel_values.view(
             grid_t,
             grid_h // merge_size,
@@ -2365,7 +2249,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         cnt_total, cnt_drop = 0, 0
         hidden_states_updated = hidden_states.clone()
 
-        # 初始化融合统计
         fusion_count = torch.zeros_like(
             hidden_states[..., 0], dtype=torch.float)  # (B, L)
         fusion_norm_ratio = torch.ones_like(
@@ -2393,7 +2276,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 seq_len, dtype=torch.bool, device=hidden_states.device)
             drop_pos = {}
 
-            # --- 第1阶段: 帧内Token合并 ---
+            # 1.token merge intra frame
             for t in unique_frames:
                 frame_indices_all = (time_ids == t).nonzero(as_tuple=True)[0]
                 frame_indices_list = [
@@ -2449,63 +2332,48 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 survivor_indices_in_frame_relative = survivor_mask_for_frame.nonzero(as_tuple=True)[
                     0]
 
-                # 如果当前帧没有幸存的token，则跳过
                 if survivor_indices_in_frame_relative.numel() == 0:
                     continue
 
                 survivor_tokens = hidden_states_updated[i,
                                                         original_visual_frame_indices[survivor_indices_in_frame_relative]]
 
-                # 定义超参数 (可以从函数参数传入)
                 gsim_threshold = 0.5  # κ (kappa)
                 gsim_temperature = 150  # τ (tau)
-
-                # 1. 计算门控相似度 (GSim)
-                # 归一化 informative tokens (Xi) 和 full tokens (Xj)
                 survivor_tokens_norm = F.normalize(
                     survivor_tokens, p=2, dim=-1)
                 original_tokens_norm = F.normalize(
                     original_frame_tokens, p=2, dim=-1)
 
-                # sim(i,j) 形状: [M, N] (M=幸存token数, N=原始token数)
                 cosine_similarities = torch.matmul(
                     survivor_tokens_norm, original_tokens_norm.t())
 
-                # 应用阈值 κ
                 gsim_matrix = torch.where(
                     cosine_similarities >= gsim_threshold,
                     cosine_similarities,
                     torch.tensor(0.0, device=hidden_states.device)
                 )
 
-                # 2. 系数归一化 (mij) - 按列进行Softmax
-                # m_matrix 形状: [M, N]
                 m_matrix = F.softmax(gsim_matrix * gsim_temperature, dim=0)
-
-                # 3. 计算注意力缩放因子 (si) - Eq. (8)
-                # s_factors 形状: [M]
                 s_factors = torch.sum(m_matrix, dim=1)
 
-                # 更新融合统计信息 (fusion_count)
                 survivor_absolute_indices = original_visual_frame_indices[
                     survivor_indices_in_frame_relative]
-                # 这里我们直接用 s_factors 替换旧的 bincount 结果
+                # Here we directly use s_factors to replace the old bincount result
                 fusion_count[i, survivor_absolute_indices] = s_factors.float()
 
-                # 4. 计算最终变换矩阵 W - Eq. (6) - 按行归一化
+                # Compute final transformation matrix W row-wise normalization
                 row_sums = torch.sum(m_matrix, dim=1, keepdim=True)
-                # 添加一个小的epsilon防止除以零
+                # Add small epsilon to prevent division by zero
                 w_matrix = m_matrix / (row_sums + 1e-8)
 
-                # 5. 计算变换后的Token Y - Eq. (6)
-                # Y = W @ X, 形状: [M, D]
+
                 transformed_tokens = torch.matmul(
                     w_matrix, original_frame_tokens)
 
-                # 6. 用新的变换后Token更新 hidden_states_updated
+                # Update hidden_states_updated with new transformed tokens
                 hidden_states_updated[i,
                                       survivor_absolute_indices] = transformed_tokens
-            # --- 最终过滤 ---
 
             dropped_hidden = hidden_states_updated[i][keep_mask]
 
@@ -2524,7 +2392,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             dropped_pos_ids_list.append(dropped_pos_ids_i.unsqueeze(1))
 
         if batch_size > 0:
-            if any(s.shape[1] != dropped_hidden_states_list[0].shape[1] for s in dropped_hidden_states_list):
+            if any(s.shape[1] != dropped_hidden_states_list[0].shape[1] forin dropped_hidden_states_list):
                 pass
             dropped_hidden_states = torch.cat(
                 dropped_hidden_states_list, dim=0)
@@ -2550,15 +2418,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             with open(dp_save_path, 'a' if os.path.exists(dp_save_path) else 'w') as f:
                 f.write(json.dumps(dropped_positions_info) + '\n')
 
-        # 裁剪融合统计信息到与dropped_hidden_states相同的序列长度
+        # Trim fusion statistics to match the sequence length of dropped_hidden_states
         if batch_size > 0:
-            # 对于每个batch sample，根据keep_mask裁剪融合统计
+            # For each batch sample, trim fusion statistics according to keep_mask
             dropped_fusion_count_list = []
             dropped_fusion_norm_ratio_list = []
 
             for i in range(batch_size):
-                # 这里需要获取每个样本的keep_mask，但当前实现中final_keep_mask只是最后一个样本的
-                # 为简化，我们假设所有样本的token数量相同
                 sample_fusion_count = fusion_count[i,
                                                    keep_mask]
                 sample_fusion_norm_ratio = fusion_norm_ratio[i,
@@ -2579,50 +2445,46 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
     def _find_bipartite_drops_by_budget(self, k_vectors: torch.Tensor, num_to_drop: int) -> torch.Tensor:
         """
-        使用二分匹配的思想，根据给定的预算（num_to_drop）来决定要丢弃哪些token。
+        Use bipartite matching principle to decide which tokens to drop based on a given budget
 
-        此函数适配了用户提供的逻辑，使其从阈值驱动变为预算驱动。
-        它只负责决策，返回要被丢弃的 token 的索引。
+        This function adapts the user-provided logic, converting it from threshold-driven to budget-driven
+        It is only responsible for decision-making and returns indices of tokens to be dropped
 
         Args:
-            k_vectors (torch.Tensor): 用于计算相似度的 K 向量（已在 head 维度上取平均）。
-            num_to_drop (int): 希望丢弃的 token 数量。
+            k_vectors (torch.Tensor): K vectors for similarity computation (averaged over head dimension)
+            num_to_drop (int): Desired number of tokens to drop.
 
         Returns:
-            torch.Tensor: 要被丢弃的 token 的索引。
+            torch.Tensor: Indices of tokens to be dropped.
         """
         device = k_vectors.device
         if k_vectors.shape[0] < 2 or num_to_drop <= 0:
             return torch.tensor([], dtype=torch.long, device=device)
 
-        # L2归一化以计算余弦相似度
+        # L2 normalization for cosine similarity computation
         metric_norm = F.normalize(k_vectors, p=2, dim=-1)
 
-        # 分割为 a 组 (偶数索引) 和 b 组 (奇数索引)
+        # Split into group a (even indices) and group b (odd indices)
         a, b = metric_norm[::2, :], metric_norm[1::2, :]
 
         if a.shape[0] == 0 or b.shape[0] == 0:
             return torch.tensor([], dtype=torch.long, device=device)
 
-        # 计算 a 中每个token与 b 中所有token的相似度
+        # Compute similarity between each token in a with all tokens in b
         scores = a @ b.transpose(-1, -2)
 
-        # 为 a 中的每个token找到它在 b 中的最佳匹配得分
-        # 我们只关心得分，不关心匹配到了 b 中的哪个具体索引
+        # Find the best match score in b for each token in a
+        # We only care about the score, not which specific index in b it matched
         best_scores_for_a, _ = scores.max(dim=-1)
 
-        # --- 核心修改：从阈值驱动改为预算驱动 ---
-        # 我们要从 a 组中丢弃 `num_to_drop` 个token，因此选择得分最高的那些
+        # We want to drop `num_to_drop` tokens from group a, so select those with highest scores
         num_can_drop = min(num_to_drop, a.shape[0])
         if num_can_drop <= 0:
             return torch.tensor([], dtype=torch.long, device=device)
 
-        # 找到得分最高的 top-k 的索引，这些索引是相对于 a 组的
+        # Find indices of top-k highest scores; these indices are relative to group a
         _, topk_indices_in_a = torch.topk(best_scores_for_a, k=num_can_drop)
 
-        # 将 a 组中的相对索引映射回原始 k_vectors 中的绝对索引
-        # a 组的token来自原始的 0, 2, 4, ... 位置
-        # dropped_indices 的值将是像 [4, 0, 8, ...] 这样的偶数
         dropped_indices = topk_indices_in_a * 2
 
         return dropped_indices
@@ -2630,18 +2492,18 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     @torch.no_grad()
     def _compress_kv_cache_with_real_query(self, hidden_states: torch.Tensor, position_embeddings: Tuple[torch.Tensor, torch.Tensor]):
         """
-        [精英选择版] 使用当前数据块的真实Query，结合动态分层预算策略来压缩KV Cache。
-
-        此版本通过一个完整的前向传播模拟来逐层生成真实的Query向量，然后计算
-        这些Query与历史Key之间的注意力分数，以此作为重要性评分，指导精英选择策略。
-
-        评分标准: S = Attn(q_real, k_past) + log(1+fusion_count) + log(v_norm)
+        [Elite Selection Version] Compress KV Cache using real Query from current data chunk, 
+        combined with dynamic layer-wise budget strategy.
+    
+        This version generates authentic Query vectors layer-by-layer through a complete 
+        forward propagation simulation, then computes attention scores between these Queries 
+        and historical Keys to serve as importance scores, guiding the elite selection strategy.
         """
         pkv = self.streaming_state["past_key_values"]
         if pkv is None or not pkv.key_cache or pkv.get_seq_length(layer_idx=0) == 0:
             return
 
-        # --- 1. 初始化和配置 ---
+        # --- 1. Initialization and Configuration ---
         kv_dtype = pkv.key_cache[0].dtype
         device = pkv.key_cache[0].device
         num_layers = len(self.layers)
@@ -2653,23 +2515,23 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if current_total_len <= total_budget:
             return
 
-        # --- 2. 使用真实Query计算所有层的重要性得分和熵 ---
+        # --- 2. Compute importance scores and entropy for all layers using real Query ---
         layer_scores = []
         layer_entropies = []
         current_hidden_states = hidden_states.clone()
         num_kv_groups = self.layers[0].self_attn.num_key_value_groups
         cos, sin = position_embeddings
 
-        # 创建一个临时的、不会被修改的 pkv 副本用于 hidden_states 的传播
+        # Create a temporary, unmodified pkv copy for hidden_states propagation
         pkv_for_propagation = pkv
 
         for layer_idx, layer in enumerate(self.layers):
-            # 安全地获取 k, v
+            # Safely get k, v
             if layer_idx >= len(pkv.key_cache):
                 continue
             k_layer, v_layer = pkv.key_cache[layer_idx], pkv.value_cache[layer_idx]
 
-            # A. 计算当前层的真实 Query
+            # A. Compute real Query for current layer
             residual = current_hidden_states
             layernorm_output = layer.input_layernorm(current_hidden_states)
             query_states = layer.self_attn.q_proj(layernorm_output)
@@ -2683,22 +2545,22 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 query_states, query_states, cos, sin, self.config.rope_scaling["mrope_section"]
             )
 
-            # B. 计算得分
+            # B. Compute scores
             with torch.autocast(device_type=k_layer.device.type, dtype=kv_dtype):
                 k_layer_repeated = repeat_kv(k_layer, num_kv_groups)
 
-                # 计算标准化的注意力分数 [bsz, num_heads, q_len, kv_len]
+                # Compute normalized attention scores [bsz, num_heads, q_len, kv_len]
                 scores_matrix = (query_states @ k_layer_repeated.transpose(-1, -2)
                                  ) / math.sqrt(layer.self_attn.head_dim)
 
-                # 聚合分数：一个历史key的重要性由它收到的来自新queries的最大注意力决定（在头之间取平均）
+                # Aggregate scores: importance of a historical key is determined by the maximum attention it receives from new queries (averaged across heads)
                 if scores_matrix.numel() > 0:
                     scores = scores_matrix.max(dim=2).values.mean(dim=[0, 1])
                 else:
                     scores = torch.tensor(
                         [], device=k_layer.device, dtype=k_layer.dtype)
 
-                # 应用 fusion_counts 和 v_norm 偏置
+                # Apply fusion_counts and v_norm bias
                 fc_layer = fusion_counts[layer_idx]
                 if fc_layer.numel() == scores.numel():
                     attention_bias = torch.log1p(
@@ -2712,7 +2574,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             final_scores = scores + log_v_norm
             layer_scores.append(final_scores)
 
-            # C. 计算熵
+            # C. Compute entropy
             if final_scores.numel() > 0:
                 probs = F.softmax(final_scores.to(torch.float32), dim=0)
                 entropy = -torch.sum(probs * torch.log(probs + 1e-9))
@@ -2720,10 +2582,10 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 entropy = torch.tensor(0.0, device=scores.device)
             layer_entropies.append(entropy * log_v_norm.mean())
 
-            # D. 传播 hidden_states 以生成下一层的 Query
+            # D. Propagate hidden_states to generate Query for next layer
             attn_output, _, _ = layer.self_attn(
                 hidden_states=layernorm_output,
-                past_key_value=pkv_for_propagation,  # 使用临时 pkv
+                past_key_value=pkv_for_propagation,  
                 use_cache=True,
                 position_embeddings=position_embeddings,
             )
@@ -2731,13 +2593,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             ffn_output = layer.mlp(layer.post_attention_layernorm(ffn_input))
             current_hidden_states = ffn_input + ffn_output
 
-        # --- 3. 动态预算分配 (与您提供的逻辑一致) ---
+        # --- 3. Dynamic Budget Allocation (consistent with provided logic) ---
         new_keys, new_values, new_fusion_counts = [
             None] * num_layers, [None] * num_layers, [None] * num_layers
         layer_lens = [pkv.get_seq_length(i) for i in range(num_layers)]
 
         if total_budget > 0:
-            smoothing_factor = 0.5  # 使用一个较平滑的值
+            smoothing_factor = 0.5 
             layer_lens_tensor = torch.tensor(
                 layer_lens, device=device, dtype=torch.float32)
             entropies_tensor = torch.stack(
@@ -2751,7 +2613,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 base_proportions + smoothing_factor * uniform_proportion
 
             num_to_keep = proportions_to_use * total_budget
-            # ... (后续预算分配和舍入逻辑与您提供的代码相同) ...
             over_allocated_mask = num_to_keep > layer_lens_tensor
             excess_budget = (
                 num_to_keep[over_allocated_mask] - layer_lens_tensor[over_allocated_mask]).sum()
@@ -2781,7 +2642,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         else:
             budgets_for_all_layers = [0] * num_layers
 
-        # --- 4. 对每一层应用精英选择策略 ---
+        # --- 4. Apply elite selection strategy to each layer ---
         for layer_idx in range(num_layers):
             if layer_idx >= len(pkv.key_cache):
                 continue
@@ -2814,7 +2675,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             new_fusion_counts[layer_idx] = fc_layer.index_select(
                 0, final_indices)
 
-        # --- 5. 更新模型状态 ---
+        # --- 5. Update Model State ---
         pkv.key_cache = [k for k in new_keys if k is not None]
         pkv.value_cache = [v for v in new_values if v is not None]
         valid_lengths = [k.shape[2] for k in pkv.key_cache if k is not None]
@@ -2860,7 +2721,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         is_video_input = video_grid_thw is not None
 
-        # --- 标准/非流式模式 ---
+        # --- Standard/Non-streaming Mode ---
         if not use_cache or not is_video_input:
             self.reset_streaming_state()
             forward_kwargs = locals()
@@ -2872,10 +2733,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             # return super().forward(**forward_kwargs) # This line might need adjustment based on inheritance.
             # For now, let's assume standard processing happens elsewhere if this branch is taken.
             pass  # Placeholder for standard forward pass
-
-        # =================================================================
-        # --- [修正版] 流式处理模式 ---
-        # =================================================================
 
         if past_key_values.get_seq_length() == 0:
             self.reset_streaming_state()
@@ -2999,7 +2856,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         for chunk in all_chunks_to_process:
             pkv = self.streaming_state["past_key_values"]
 
-            # MODIFICATION START: Calculate average tokens across all layers
             kv_tokens_before = 0
             num_layers_with_cache = 0
             if pkv and getattr(pkv, 'key_cache', None) and len(pkv.key_cache) > 0:
@@ -3008,11 +2864,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                                    for i in range(num_layers_with_cache))
                 kv_tokens_before = total_tokens / \
                     num_layers_with_cache if num_layers_with_cache > 0 else 0
-            # MODIFICATION END
             if chunk["embeds"].shape[1] > 1:
                 self._compress_kv_cache()
 
-            # MODIFICATION START: Recalculate average tokens after compression
             kv_tokens_after = 0
             if pkv and getattr(pkv, 'key_cache', None) and len(pkv.key_cache) > 0:
                 # The number of layers might have changed if some were emptied, re-check
@@ -3021,7 +2875,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     total_tokens_after = sum(pkv.get_seq_length(
                         layer_idx=i) for i in range(num_layers_with_cache_after))
                     kv_tokens_after = total_tokens_after / num_layers_with_cache_after
-            # MODIFICATION END
 
             # The calculation method itself is correct, now it uses the averaged values
             self._benchmark_stats["kv_cache_compressed"] += (
@@ -3064,7 +2917,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         final_hidden_states = self.norm(
             last_hidden_state_of_sequence) if last_hidden_state_of_sequence is not None else torch.zeros_like(inputs_embeds[:, :1, :])
 
-        # MODIFICATION START: Calculate final average KV token count across all layers
         final_kv_count_avg = 0
         if final_pkv and getattr(final_pkv, 'key_cache', None) and len(final_pkv.key_cache) > 0:
             num_layers_final = len(final_pkv.key_cache)
@@ -3073,16 +2925,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             final_kv_count_avg = total_final_tokens / num_layers_final
 
         self._benchmark_stats["remaining_kv_tokens"] = final_kv_count_avg
-        # MODIFICATION END
-
-        # stats_file_path = "/data1/nyh/qwen2_5vl/eval/compression_benchmark_statsmlvu0.75768.jsonl"
-        # try:
-        #     with open(stats_file_path, "a") as f:
-        #         stats_to_save = {k: float(v) if hasattr(
-        #             v, 'item') else v for k, v in self._benchmark_stats.items()}
-        #         f.write(json.dumps(stats_to_save) + "\n")
-        # except Exception as e:
-        #     print(f"警告: 写入benchmark统计数据时出错: {e}")
 
         if not return_dict:
             return (final_hidden_states, final_pkv)
@@ -3102,31 +2944,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool,
     ):
-        # fusion_counts = getattr(past_key_values, "fusion_counts", None)
-
-        # if fusion_counts is not None:
-        #     # 如果 fusion_counts 存在，说明我们处于流式解码阶段，需要自定义掩码
-        #     # bsz, q_len, _ = input_tensor.shape
-        #     q_len = input_tensor.shape[1]
-        #     kv_seq_len = past_key_values.get_seq_length() + q_len
-
-        #     # 创建一个全零的偏置，允许新 query 关注所有历史 key
-        #     attn_bias = torch.zeros(
-        #         1, 1, q_len, kv_seq_len, device=input_tensor.device, dtype=input_tensor.dtype)
-
-        #     # 添加 fusion_count 修正
-        #     correction_len = min(kv_seq_len, fusion_counts.shape[-1])
-        #     if correction_len > 0:
-        #         attention_correction = torch.log1p(
-        #             fusion_counts[..., :correction_len]-1
-        #         ).unsqueeze(0).unsqueeze(0).unsqueeze(0)
-
-        #         # 在解码时，q_len=1，所以 attn_bias 的形状是 [1, 1, 1, kv_seq_len]
-        #         # attention_correction 的形状是 [1, 1, 1, correction_len]
-        #         # 它们可以完美地相加
-        #         attn_bias[..., :correction_len] += attention_correction
-
-        #     return attn_bias
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and past_key_values is not None:
                 is_padding_right = attention_mask[:, -
@@ -3678,9 +3495,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # print(2519, position_ids)
         if inputs_embeds is None:
-            # print(2836)
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
@@ -3705,7 +3520,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     image_mask, image_embeds)
 
             if pixel_values_videos is not None:
-                # print(2861)
                 pixel_values_videos = pixel_values_videos.type(
                     self.visual.dtype)
                 video_embeds = self.visual(
@@ -3714,7 +3528,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     input_ids == self.config.video_token_id).sum().item()
                 n_video_features = video_embeds.shape[0]
                 if n_video_tokens != n_video_features:
-                    # print(2870)
                     raise ValueError(
                         f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
                     )
@@ -3729,12 +3542,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 inputs_embeds = inputs_embeds.masked_scatter(
                     video_mask, video_embeds)
 
-            # print(2883)
             if attention_mask is not None:
-                # print(2886)
                 attention_mask = attention_mask.to(inputs_embeds.device)
-                # print(2888)
-        # print(2884)
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
             # calculate RoPE index once per generation in the pre-fill stage only
@@ -3768,7 +3577,6 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-        # print(2918)
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
