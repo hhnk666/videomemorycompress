@@ -368,10 +368,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
         device: torch.device,
     ) -> Optional[torch.Tensor]:
         """
-        根据 fusion_counts 创建一个注意力偏置（attention bias）。
-        该掩码包含两部分：
-        1. 对当前查询序列（query tokens）应用的因果关系（Causal Mask）。
-        2. 根据 fusion_counts 为所有键（key tokens）添加的偏置，以增强融合后 token 的重要性。
+        Creates an attention bias based on fusion_counts.
+        This mask consists of two components:
+        1. A causal mask applied to the current query sequence (query tokens).
+        2. A bias added to all key tokens based on fusion_counts to enhance 
+           the importance of merged tokens.
         """
         if q_len == 0:
             return None
@@ -411,7 +412,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         return attn_bias
 
-    # ============================== START: MODIFIED FORWARD METHOD ==============================
     @check_model_inputs
     @auto_docstring
     def forward(
@@ -438,12 +438,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # 核心修复：
-        # 对于流式处理，position_ids 是由上层逻辑（LlavaOnevisionModel）根据“逻辑序列长度”精确计算得出的。
-        # 它必须被提供，绝不能回退到使用代表“物理缓存长度”的 cache_position。
-        # 此处的断言强制执行了这一设计，确保位置信息不会因 token 压缩而错乱。
         if position_ids is None:
-            # 在标准的非流式 generate 调用中，cache_position 是正确的
+            # In standard non-streaming generate calls, cache_position is correct
             if cache_position is None:
                 past_seen_tokens = past_key_values.get_seq_length(
                 ) if past_key_values is not None else 0
@@ -452,15 +448,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 )
             position_ids = cache_position.unsqueeze(0)
 
-        # 基于正确的逻辑 position_ids，一次性计算出本轮输入对应的旋转位置编码。
-        # 这个 position_embeddings 将被传递给所有层，保证一致性。
+        # Compute rotary position embeddings for the current input based on 
+        # the correct logical position_ids in one go.
+        # This position_embeddings will be passed to all layers to ensure consistency.
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         causal_mask_mapping = None
 
-        # 根据是否处于流式模式（由 layer_fusion_counts 判断）来决定 Attention Mask 的生成方式
+        # Determine the Attention Mask generation method based on whether 
+        # streaming mode is active (indicated by layer_fusion_counts)
         if layer_fusion_counts is None:
-            # 标准路径：使用 Hugging Face 的标准工具生成因果掩码或滑动窗口掩码。
             mask_kwargs = {
                 "config": self.config, "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask, "cache_position": cache_position,
@@ -475,12 +472,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
             else:
                 causal_mask_mapping = attention_mask
 
-        # 逐层处理
         for layer_idx, decoder_layer in enumerate(self.layers):
             attention_mask_for_layer = None
 
             if layer_fusion_counts is not None:
-                # 流式路径：动态创建包含了融合偏置（fusion bias）的注意力掩码。
                 q_len, batch_size = inputs_embeds.shape[1], inputs_embeds.shape[0]
                 past_kv_len = past_key_values.get_seq_length(
                     layer_idx) if past_key_values is not None else 0
@@ -493,11 +488,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     batch_size=batch_size, dtype=inputs_embeds.dtype, device=inputs_embeds.device,
                 )
             else:
-                # 标准路径：使用预先计算好的掩码。
                 attention_mask_for_layer = causal_mask_mapping[decoder_layer.attention_type]
 
-            # 将为该层准备好的所有信息传递给解码层。
-            # position_embeddings 此时已确保是基于正确的逻辑位置计算得出的。
+            # Pass all information prepared for this layer to the decoder layer.
+            # position_embeddings is now guaranteed to be calculated based on correct logical positions.
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask_for_layer,
@@ -505,7 +499,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
 
-                position_embeddings=position_embeddings,  # 传递预先计算好的编码
+                position_embeddings=position_embeddings,  
                 **kwargs,
             )
 
@@ -514,7 +508,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
-    # =============================== END: MODIFIED FORWARD METHOD ===============================
 
 
 @auto_docstring
