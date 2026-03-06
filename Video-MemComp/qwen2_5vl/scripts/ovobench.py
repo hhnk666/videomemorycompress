@@ -102,7 +102,6 @@ def build_prompt(task, question, options, _anno_, index):
 
 def chunk_video(video_path, end_time, start_time=0):
     end_time = math.ceil(end_time)
-    # 检查是否已经存在 chunked video
     video_name = osp.splitext(osp.basename(video_path))[0]
     output_dir = osp.join(VIDEO_DIR, "chunked")
     if not osp.exists(output_dir):
@@ -112,9 +111,7 @@ def chunk_video(video_path, end_time, start_time=0):
     if osp.exists(output_file):
         logger.debug(f"Chunked video {output_file} already exists")
         return output_file
-    # 如果不存在，进行分割
     video = VideoFileClip(video_path)
-    # 确保 end_time 不超过视频长度
     if end_time > video.duration:
         end_time = video.duration
     clip = video.subclip(start_time, end_time)
@@ -405,7 +402,6 @@ if __name__ == "__main__":
         attn_implementation="flash_attention_2",
         device_map="cpu",
     )
-    logger.info("模型已加载到 CPU。")
 
     llm_config = model.model.config
     for i, layer in enumerate(model.model.layers):
@@ -428,31 +424,7 @@ if __name__ == "__main__":
     # Load task info
     with open(TASK_JSON, 'r') as f:
         task_list = json.load(f)
-    # # 已经测试过的数据
-    # ckpt_data = "/data1/nyh/qwen2_5vl/eval/result_ovobench0.80.850.20.4/output/feature_0d5_20251214_195542.jsonl"
-    # ## MODIFICATION START ###
-    # completed_ids = set()
-    # # 检查包含先前结果的文件是否存在
-    # if osp.exists(ckpt_data):
-    #     logger.info(
-    #         f"Loading previous results from {ckpt_data} to filter tasks and include in final score.")
-    #     # 打开旧结果文件和新输出文件
-    #     with open(ckpt_data, 'r') as f_old, open(OUTPUT_JSONL, 'w') as f_new:
-    #         for line in f_old:
-    #             # 1. 将旧结果直接写入新文件，以便最终计分
-    #             f_new.write(line)
-    #             # 2. 解析每一行以获取任务ID，用于跳过任务
-    #             try:
-    #                 data = json.loads(line)
-    #                 if 'id' in data:
-    #                     completed_ids.add(data['id'])
-    #             except json.JSONDecodeError:
-    #                 logger.warning(
-    #                     f"Could not parse line in {ckpt_data}: {line.strip()}")
-    #     logger.info(
-    #         f"Loaded and filtered {len(completed_ids)} completed tasks. These will be skipped.")
-    # # # ### MODIFICATION END ###
-    # Inference
+
     model.model.inter_drop = 0.85
     start_time = time.time()
     for item in tqdm(task_list):
