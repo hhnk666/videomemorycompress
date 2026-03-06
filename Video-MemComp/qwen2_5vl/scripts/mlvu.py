@@ -18,20 +18,17 @@ from collections import defaultdict
 import argparse
 import sys
 
-# 确保自定义模型的定义在 Python 路径中
 sys.path.append(osp.abspath(osp.join(osp.dirname(__file__), '..')))
 try:
     from qwen_vl_utils import process_vision_info
     from qwen2_5_vl import (
         Qwen2_5_VLForConditionalGeneration,
-        Qwen2_5_VLSdpaAttention,  # 确保这个模块存在且可导入
+        Qwen2_5_VLSdpaAttention,  
     )
 except ImportError:
-    print("导入失败。请确保 'qwen_vl_utils' 和 'qwen2_5_vl' 模块在您的 PYTHONPATH 中并且可访问。")
+    print("Import failed. Please ensure 'qwen_vl_utils' and 'qwen2_5_vl' modules are in your PYTHONPATH and accessible.")
     sys.exit(1)
 
-
-# --- 默认参数定义 ---
 RUN_NAME = "mlvu_eval_run"
 DROP_METHOD = 'none'
 DROP_THRESHOLD = 0.5
@@ -44,23 +41,18 @@ MAX_PIXELS = 448 * 448
 MAX_FRAMES = 1145
 MIN_FRAMES = 4
 
-# --- 提示模板 ---
 prompt = """Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, D, etc.) of the correct option.
 Question: {}
 Options:
 {}
 The best answer is:"""
 
-
-# --- 日志记录器设置 ---
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 fmt_str = "%(asctime)s %(levelname)5s | %(message)s"
 fmt = logging.Formatter(fmt_str)
 
-
-# --- 辅助函数 ---
-def extract_characters_regex(s):
+def extract_characters_regex():
     s = s.strip()
     answer_prefixes = [
         "The best answer is", "The correct answer is", "The answer is", "The answer",
@@ -91,18 +83,18 @@ def merge_jsonl_files(base_path, world_size):
                         merged_data.append(json.loads(line))
                     except json.JSONDecodeError:
                         logger.warning(
-                            f"无法解析文件 {file_path} 中的行: {line.strip()}")
+                            f"Failed to parse line in file {file_path}: {line.strip()}")
     merged_file_path = f"{base_path}_merged.jsonl"
     with open(merged_file_path, 'w', encoding='utf-8') as f:
         for item in merged_data:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
-    logger.info(f"成功合并 {len(merged_data)} 条记录到 {merged_file_path}")
+    logger.info(f"Successfully merged {len(merged_data)} records to {merged_file_path}")
     return merged_file_path
 
 
 # --- 主脚本 ---
 def main():
-    parser = argparse.ArgumentParser(description="在 MLVU 数据集上进行分布式评测。")
+    parser = argparse.ArgumentParser(description="Distributed evaluation script for MLVU dataset.")
     parser.add_argument("--run_name", type=str, default=RUN_NAME)
     parser.add_argument("--drop_method", type=str, default=DROP_METHOD)
     parser.add_argument("--drop_threshold", type=float, default=DROP_THRESHOLD)
@@ -117,14 +109,14 @@ def main():
     parser.add_argument("--max_frames", type=int, default=MAX_FRAMES)
     args = parser.parse_args()
 
-    # --- 1. 分布式环境初始化 ---
+    # --- 1. Distributed Environment Initialization ---
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend='nccl')
     world_size = dist.get_world_size()
     is_main_process = local_rank == 0
 
-    # --- 2. 路径和日志设置 ---
+    # --- 2. Path and Logging Configuration ---
     curr_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     if is_main_process:
         os.makedirs(args.result_dir, exist_ok=True)
@@ -144,20 +136,20 @@ def main():
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(fmt)
         logger.addHandler(stream_handler)
-    logger.info(f"--- [Rank {local_rank}/{world_size}] 进程启动 ---")
-    logger.info(f"运行配置: {vars(args)}")
+    logger.info(f"--- [Rank {local_rank}/{world_size}] Process started ---")
+    logger.info(f"Run configuration: {vars(args)}")
 
-    # --- 3. 模型加载与修改 ---
-    # <--- 这是解决您报错的关键代码部分 ---
+
+    # --- 3. Model Loading and Modification ---
     torch.manual_seed(1234)
-    logger.info("设置全局随机种子为 1234")
+    logger.info("Setting global random seed to 1234")
     if not is_flash_attn_2_available():
-        logger.error("Flash Attention 2 不可用，此脚本依赖于注意力替换逻辑，程序将退出。")
+        logger.error("Flash Attention 2 is not available. This script depends on attention replacement logic. Exiting.")
         sys.exit(1)
 
     if not is_main_process:
         dist.barrier()
-    logger.info("步骤 1: 在 CPU 上加载模型以准备替换注意力模块...")
+    logger.info("Step 1: Loading model on CPU to prepare for attention module replacement...")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.ckpt_path,
         torch_dtype=torch.bfloat16,
@@ -165,11 +157,11 @@ def main():
         device_map="cpu",
     )
     model.model.size = 3
-    logger.info("模型已加载到 CPU。")
+    logger.info("Model loaded to CPU.")
     if is_main_process:
         dist.barrier()
 
-    logger.info(f"[Rank {local_rank}] 步骤 2: 将语言模型的注意力机制替换为 SDPA...")
+    logger.info(f"[Rank {local_rank}] Step 2: Replacing language model attention mechanism with SDPA...")
     llm_config = model.model.config
     for i, layer in enumerate(model.model.layers):
         original_flash_attn_module = layer.self_attn
@@ -178,24 +170,23 @@ def main():
             config=llm_config, layer_idx=i)
         new_sdpa_attn_module.load_state_dict(original_state_dict)
         layer.self_attn = new_sdpa_attn_module.to(dtype=torch.bfloat16)
-    logger.info(f"[Rank {local_rank}] 语言模型的注意力模块已全部替换。")
+    logger.info(f"[Rank {local_rank}] All language model attention modules have been replaced.")
 
-    logger.info(f"[Rank {local_rank}] 步骤 3: 将修改后的模型部署到 cuda:{local_rank}...")
+    logger.info(f"[Rank {local_rank}] Step 3: Deploying modified model to cuda:{local_rank}...")
     model.to(f'cuda:{local_rank}')
-    logger.info(f"[Rank {local_rank}] 模型已成功部署到 GPU。")
-    # --- 关键代码部分结束 ---
+    logger.info(f"[Rank {local_rank}] Model successfully deployed to GPU.")
 
     processor = AutoProcessor.from_pretrained(
         args.ckpt_path,
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
     )
-    logger.info(f"[Rank {local_rank}] 预处理器加载完毕。")
+    logger.info(f"[Rank {local_rank}] Preprocessor loaded successfully.")
 
-    # --- 4. 数据加载与分布式切分 ---
-    logger.info(f"[Rank {local_rank}] 正在从 {args.task_json} 加载和处理 MLVU 数据...")
+    # --- 4. Data Loading and Distributed Splitting ---
+    logger.info(f"[Rank {local_rank}] Loading and processing MLVU data from {args.task_json}...")
     if not osp.exists(args.task_json):
-        logger.error(f"任务文件未找到: {args.task_json}")
+        logger.error(f"Task file not found: {args.task_json}")
         sys.exit(1)
     with open(args.task_json, 'r', encoding='utf-8') as f:
         full_data = json.load(f)
@@ -220,7 +211,8 @@ def main():
     rank_indices = indices[local_rank::world_size]
     task_data = [all_questions[i] for i in rank_indices]
     logger.info(
-        f"[Rank {local_rank}] 数据扁平化和切分完毕，本进程将处理 {len(task_data)} / {num_samples} 个问题。")
+        f"[Rank {local_rank}] Data flattening and splitting complete. This process will handle {len(task_data)} / {num_samples} questions.")
+
 
     processed_ids = set()
     if osp.exists(output_jsonl_path):
@@ -235,9 +227,8 @@ def main():
         task_data = [
             item for item in task_data if item['question_id'] not in processed_ids]
         logger.info(
-            f"[Rank {local_rank}] 从已有输出文件中恢复进度，跳过 {original_count - len(task_data)} 个已完成任务。")
+            f"[Rank {local_rank}] Resuming progress from existing output file. Skipping {original_count - len(task_data)} completed tasks.")
 
-    # --- 5. 推理循环 ---
     start_time = time.time()
     cnt_total = defaultdict(int)
     cnt_correct = defaultdict(int)
@@ -252,14 +243,8 @@ def main():
             video_path = osp.join(args.video_dir, item['video_path'])
             if not osp.exists(video_path):
                 logger.warning(
-                    f"视频文件未找到: {video_path}，跳过问题 {item['question_id']}")
+                    f"Video file not found: {video_path}, skipping question {item['question_id']}")
                 continue
-
-            # duration = item.get('duration', -1)
-            # if duration > 0 and duration < 180:
-            #     current_fps = 4.0
-            # else:
-            #     current_fps = 0.5
 
             options_str = "\n".join(
                 [f"{chr(65+i)}) {choice}" for i, choice in enumerate(item['choices'])])
@@ -291,7 +276,7 @@ def main():
                 correct_letter = chr(65 + answer_idx)
             except ValueError:
                 logger.warning(
-                    f"答案 '{item['answer']}' 不在选项列表 {item['choices']} 中，跳过问题 {item['question_id']}")
+                    f"Answer '{item['answer']}' not found in options list {item['choices']}, skipping question {item['question_id']}")
                 continue
 
             pred_letter = extract_characters_regex(response)
@@ -313,12 +298,11 @@ def main():
 
         except Exception as e:
             logger.error(
-                f"[Rank {local_rank}] 处理 {item.get('question_id', 'N/A')} 时发生严重错误: {e}")
+                f"[Rank {local_rank}] Critical error processing {item.get('question_id', 'N/A')}: {e}")
             traceback.print_exc()
 
-    # --- 6. 结果汇总与清理 ---
     dist.barrier()
-    logger.info(f"[Rank {local_rank}] 推理完成，等待所有进程并开始汇总...")
+    logger.info(f"[Rank {local_rank}] Inference complete. Waiting for all processes and starting aggregation...")
     all_question_types = sorted(
         list(set(q['question_type'] for q in all_questions)))
     stats_list = [cnt_total['overall'], cnt_correct['overall']]
@@ -329,7 +313,7 @@ def main():
     dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
 
     if is_main_process:
-        logger.info("--- 所有进程已完成，开始最终结果汇总 ---")
+        logger.info("--- All processes completed. Starting final result aggregation ---")
         base_output_path = osp.join(
             args.result_dir, 'output', f"{args.run_name}_{curr_time}")
         merge_jsonl_files(base_output_path, world_size)
@@ -341,13 +325,13 @@ def main():
         total_processed = stats_tensor[0].item()
         total_correct = stats_tensor[1].item()
         if total_processed == 0:
-            logger.info("所有进程均未成功处理任何问题。")
+            logger.info("No questions were successfully processed by any process.")
         else:
             accuracy = 100 * total_correct / total_processed
             logger.info(
-                f"【总结果】: 总数={total_processed}, 正确={total_correct}, 准确率={accuracy:.2f}%")
+                f"[Overall Results]: Total={total_processed}, Correct={total_correct}, Accuracy={accuracy:.2f}%")
 
-        logger.info("--- 按问题类型分类准确率 ---")
+        logger.info("--- Accuracy by Question Type ---")
         for i, q_type in enumerate(all_question_types):
             total_cat = stats_tensor[2 + i*2].item()
             correct_cat = stats_tensor[3 + i*2].item()
@@ -357,7 +341,7 @@ def main():
                     f"  - {q_type:<18}: {correct_cat}/{total_cat} = {acc_cat:.2f}%")
         cost_time = int(time.time() - start_time)
         logger.info(
-            f"总推理耗时: {cost_time // 3600}h {(cost_time % 3600) // 60}m {cost_time % 60}s (此为单个进程耗时，非总和)")
+            f"Total inference time: {cost_time // 3600}h {(cost_time % 3600) // 60}m {cost_time % 60}s (This is per-process time, not cumulative)")
 
     dist.destroy_process_group()
 
