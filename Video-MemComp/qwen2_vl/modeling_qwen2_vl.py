@@ -989,7 +989,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
     def reset_streaming_state(self):
         """
-        显式重置模型的流式处理状态，用于在处理新的独立样本前调用。
+        reset the state of streaming
         """
         print("--- Resetting model streaming state for new sample ---")
         self.streaming_state = {
@@ -1002,9 +1002,10 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
     @torch.no_grad()
     def _proxy_prefill_and_get_queries(self, past_key_values: Cache):
         """
-        [重构版] 为重要性评分生成代理查询（proxy queries）。
-        此版本使用安全的 API 访问 KV Cache，并为每一层动态生成正确的 Attention Mask 和
-        位置编码，以精确适应各层长度不一的复杂情况。
+        [Refactored Version] Generate proxy queries for importance scoring.
+        This version uses safe API access to KV Cache and dynamically generates 
+        correct Attention Masks and position encodings for each layer, to precisely 
+        adapt to complex scenarios where layers have varying lengths.
         """
         device = self.language_model.embed_tokens.weight.device
         proxy_ids = torch.tensor(
@@ -1022,7 +1023,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         proxy_queries_per_layer = []
         hidden_states = proxy_embeds
 
-        # 2. 逐层模拟前向传播
+        # Simulate forward propagation layer by layer
         for layer_idx, layer in enumerate(self.language_model.layers):
             layernorm_output = layer.input_layernorm(hidden_states)
 
@@ -1036,7 +1037,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             proxy_pos_embeds = self.language_model.rotary_emb(
                 proxy_embeds, proxy_pos_ids)
 
-            # 4. 提取用于评分的旋转后查询向量 (q_rot)
+            # Extract rotation-applied query vectors (q_rot) for scoring
             q_vectors = layer.self_attn.q_proj(layernorm_output)
             q_vectors = q_vectors.view(
                 bsz, q_len, layer.self_attn.num_heads, layer.self_attn.head_dim
@@ -1047,7 +1048,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             )
             proxy_queries_per_layer.append(q_rot)
 
-            # 5. 为当前层动态生成正确的 Attention Mask
+            # Dynamically generate correct Attention Mask for current layer
             total_kv_len = current_past_len + q_len
             attention_mask = torch.zeros(
                 (bsz, 1, q_len, total_kv_len), dtype=hidden_states.dtype, device=device
@@ -1082,8 +1083,10 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         in_frame_threshold: float
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        单次二分图合并，用合并后的向量替换目标位置，并返回被合并掉的token的索引。
-        此函数精确控制梯度：决策过程无梯度，合并过程有梯度。
+        Perform a single bipartite graph merge: replace target positions with 
+        merged vectors and return indices of tokens that were merged away.
+        This function precisely controls gradients: the decision process is 
+        gradient-free, while the merging process retains gradients.
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
@@ -1331,16 +1334,13 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
     def _compress_kv_cache(self):
         """
-        采用"均匀+固定比例+动态熵"三合一混合策略的KV Cache压缩。
-        - 30% 均匀分配，保证鲁棒性
-        - 35% 基于先验知识的固定比例分配
-        - 35% 基于当前上下文的动态熵分配
+        KV Cache compression using a "Uniform + Fixed Ratio + Dynamic Entropy" tri-hybrid strategy.
         """
         pkv = self.streaming_state["past_key_values"]
         if pkv is None or pkv.get_seq_length(layer_idx=0) == 0:
             return
 
-        # 1. 初始化和配置 (逻辑不变)
+        # 1. Initialization and Configuration
         try:
             kv_dtype = pkv.key_cache[0].dtype if hasattr(
                 pkv, 'key_cache') and pkv.key_cache else torch.bfloat16
@@ -1362,7 +1362,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         if current_total_len <= total_budget:
             return
 
-        # 2. 计算重要性得分和熵 (恢复熵的计算)
+        # 2. Calculate Importance Scores and Entropy
         pkv_clone = DynamicCache()
         if pkv.get_seq_length() > 0:
             for layer_idx in range(num_layers):
@@ -1373,7 +1373,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         num_kv_groups = self.language_model.layers[0].self_attn.num_key_value_groups
 
         layer_scores = []
-        layer_entropies = []  # <--- 恢复熵列表
+        layer_entropies = []  
 
         for layer_idx in range(num_layers):
             k_layer, v_layer = pkv[layer_idx]
@@ -1400,16 +1400,14 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
             layer_scores.append(scores)
 
-            # --- 恢复熵的计算逻辑 ---
             if scores.numel() > 0:
                 probs = F.softmax(scores.to(torch.float32), dim=0)
                 entropy = -torch.sum(probs * torch.log(probs + 1e-9))
             else:
                 entropy = torch.tensor(0.0, device=scores.device)
-            # 使用 v_norm 对熵进行加权，使其更关注值较大的token
             layer_entropies.append(torch.log1p_(entropy) * log_v_norm.mean())
 
-        # 3. 动态预算分配 (采用三合一混合策略)
+        # Dynamic Budget Allocation
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
         new_fusion_counts = [None] * num_layers
@@ -1419,22 +1417,17 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             weight_uniform = 0.3
             weight_static = 0.6
             weight_entropy = 0.1
-
-            # 1. 均匀分配比例
             uniform_proportions = torch.full(
                 (num_layers,), 1.0 / num_layers, device=device)
-
-            # 2. 基于先验知识的固定比例
             static_ratios_list = [101, 86, 82, 79, 77, 74, 71, 64, 58, 54, 52,
                                   52, 50, 47, 46, 44, 43, 41, 39, 36, 33, 29, 25, 21, 19, 16, 13, 8]
             if len(static_ratios_list) != num_layers:
                 raise ValueError(
-                    f"提供的静态比例数量 ({len(static_ratios_list)})与模型层数 ({num_layers})不匹配。")
+                    f"The number of provided static ratios ({len(static_ratios_list)}) does not match the number of model layers ({num_layers}).")
             static_ratios_tensor = torch.tensor(
                 static_ratios_list, dtype=torch.float32, device=device)
             static_proportions = static_ratios_tensor / static_ratios_tensor.sum()
 
-            # 3. 基于动态熵的比例
             entropies_tensor = torch.stack(layer_entropies)
             entropies_tensor = entropies_tensor - entropies_tensor.min()
             total_entropy = entropies_tensor.sum()
@@ -1485,7 +1478,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
         print(
             f"KV Cache compression budgets per layer: {budgets_for_all_layers}")
-        print(f"校验总和: {sum(budgets_for_all_layers)}")
+        print(f"Verify total sum: {sum(budgets_for_all_layers)}")
 
         new_keys = [None] * num_layers
         new_values = [None] * num_layers
@@ -1566,7 +1559,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         max_iterations: int = 10
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
-        递归执行token合并，通过多次二分图合并最多可以砍掉7/8的tokens。
+        Recursively performs token merging as described in https://arxiv.org/pdf/2210.09461.
         """
         if frame_hs.shape[0] < 2:
             return frame_hs, torch.tensor([], dtype=torch.long, device=frame_hs.device)
