@@ -1,4 +1,4 @@
-# 🎬 **Video-MemComp: Extreme O(1)-Memory Compression for Streaming Video Understanding via Taylor Expansion**
+# 🎬 **Video-MemComp: Taylor-Guided Sensitivity-Aware Memory Management for Streaming Video Understanding**
 [**🏠 Project Page**](https://hhnk666.github.io/Video-MemComp.github.io) | [**📄 Arxiv (Coming Soon)**]()
 
 <img width="1660" height="1117" alt="image" src="https://github.com/user-attachments/assets/7b6fcf51-4101-434a-85eb-5f8187df02d1" />
