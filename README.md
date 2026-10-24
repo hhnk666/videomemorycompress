@@ -333,3 +333,7 @@ bash eval_ovobench.sh
 ---
 
 # 📎 Citation
+
+```bash
+Yonghui Niu, Yuhao Ji, Chang Nie, Jiao Zhang, Yilong Li, Junlan Feng, Ran He, Caifeng Shan, and Chaoyou Fu. 2026. Video-MemComp: Taylor-Guided Sensitivity-Aware Memory Management for Streaming Video Understanding. In Proceedings of the 34th ACM International Conference on Multimedia (MM ’26), November 10–14, 2026, Rio de Janeiro, Brazil. ACM, New York, NY, USA, 10 pages. https://doi.org/10.1145/3767308.3835474
+```
